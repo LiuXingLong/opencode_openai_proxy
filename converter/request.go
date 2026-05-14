@@ -49,6 +49,8 @@ type inputItem struct {
 	Type    string          `json:"type,omitempty"`
 	Role    string          `json:"role,omitempty"`
 	Content json.RawMessage `json:"content,omitempty"`
+	CallID  string          `json:"call_id,omitempty"`
+	Output  string          `json:"output,omitempty"`
 }
 
 type contentPart struct {
@@ -70,7 +72,7 @@ func ConvertRequest(raw []byte) ([]byte, error) {
 		Stop:             req.Stop,
 		FrequencyPenalty: req.FrequencyPenalty,
 		PresencePenalty:  req.PresencePenalty,
-		Tools:            req.Tools,
+		Tools:            convertTools(req.Tools),
 		ToolChoice:       req.ToolChoice,
 		Stream:           req.Stream,
 		StreamOptions:    req.StreamOptions,
@@ -126,6 +128,18 @@ func convertInput(raw json.RawMessage) ([]Message, error) {
 
 	var msgs []Message
 	for _, item := range items {
+		if item.Type == "function_call_output" {
+			output := item.Output
+			if output == "" {
+				continue
+			}
+			text := "工具执行结果:\n" + output
+			msgs = append(msgs, Message{
+				Role:    "user",
+				Content: mustJSON(text),
+			})
+			continue
+		}
 		if item.Type != "" && item.Type != "message" {
 			continue
 		}
@@ -174,6 +188,82 @@ func mustJSON(v interface{}) json.RawMessage {
 	if err != nil {
 		panic(err)
 	}
+	return b
+}
+
+var builtinToolMapping = map[string]map[string]interface{}{
+	"web_search": {
+		"name":        "web_search",
+		"description": "Search the web for information",
+		"parameters": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "The search query",
+				},
+			},
+			"required": []string{"query"},
+		},
+	},
+}
+
+func convertTools(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || raw[0] != '[' {
+		return raw
+	}
+
+	var tools []json.RawMessage
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return raw
+	}
+
+	var converted []json.RawMessage
+	for _, t := range tools {
+		var toolMap map[string]interface{}
+		if err := json.Unmarshal(t, &toolMap); err != nil {
+			continue
+		}
+
+		toolType, _ := toolMap["type"].(string)
+		switch toolType {
+		case "function":
+			funcDef := make(map[string]interface{})
+			for k, v := range toolMap {
+				if k != "type" {
+					funcDef[k] = v
+				}
+			}
+			chatTool := map[string]interface{}{
+				"type":     "function",
+				"function": funcDef,
+			}
+			converted = append(converted, mustJSON(chatTool))
+		default:
+			mapping, ok := builtinToolMapping[toolType]
+			if !ok {
+				mapping = map[string]interface{}{
+					"name":        toolType,
+					"description": "Execute a " + toolType + " tool",
+					"parameters": map[string]interface{}{
+						"type":       "object",
+						"properties": map[string]interface{}{},
+					},
+				}
+			}
+			chatTool := map[string]interface{}{
+				"type":     "function",
+				"function": mapping,
+			}
+			converted = append(converted, mustJSON(chatTool))
+		}
+	}
+
+	if len(converted) == 0 {
+		return nil
+	}
+
+	b, _ := json.Marshal(converted)
 	return b
 }
 

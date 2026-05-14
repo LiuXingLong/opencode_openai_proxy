@@ -81,8 +81,4 @@ case "${1:-}" in
         echo "用法: $0 {build|start|stop|restart|reopen}"
         exit 1
         ;;
-    *)
-        echo "用法: $0 {build|start|stop|restart}"
-        exit 1
-        ;;
 esac

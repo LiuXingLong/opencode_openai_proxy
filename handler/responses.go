@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
 	"github.com/LiuXingLong/opencode-openai-proxy/converter"
 	"github.com/LiuXingLong/opencode-openai-proxy/logger"
 	"github.com/LiuXingLong/opencode-openai-proxy/middleware"
 	"github.com/LiuXingLong/opencode-openai-proxy/proxy"
+	"github.com/gin-gonic/gin"
 )
 
 type ResponsesHandler struct {
@@ -70,9 +72,7 @@ func (h *ResponsesHandler) Create(c *gin.Context) {
 			"status", upstreamResp.StatusCode,
 			"body", string(respBody),
 		)
-		c.JSON(upstreamResp.StatusCode, gin.H{
-			"error": fmt.Sprintf("upstream error: %s", string(respBody)),
-		})
+		c.Data(upstreamResp.StatusCode, "application/json", respBody)
 		return
 	}
 
@@ -122,26 +122,63 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 	scanner := bufio.NewScanner(upstreamBody)
 	scanner.Buffer(make([]byte, 0, 1024*64), 1024*1024)
 
-	itemAdded := false
+	// 按 index 记录已添加的 function_call item（避免重复发送 item_added）
+	addedFCIndexes := map[int]bool{}
+	fcItemIDs := map[int]string{}
+	fcOutputIndex := map[int]int{}
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		deltaText, finishReason, isDone, upstreamUsage := converter.ParseChatStreamLine(line)
+		deltaText, finishReason, isDone, upstreamUsage, toolCallDeltas := converter.ParseChatStreamLine(line)
 
 		if isDone {
 			break
 		}
 
-		if deltaText != "" && !itemAdded {
-			itemEvent := converter.BuildStreamItemAddedEvent(state.MsgID, "assistant", state.OutputIndex)
-			fmt.Fprint(c.Writer, itemEvent)
-			itemAdded = true
+		// 处理 tool_calls deltas
+		for _, tcd := range toolCallDeltas {
+			if !addedFCIndexes[tcd.Index] {
+				addedFCIndexes[tcd.Index] = true
+				itemID := "fcall_" + uuid.New().String()
+				fcItemIDs[tcd.Index] = itemID
+				oidx := state.NextOutputIndex()
+				fcOutputIndex[tcd.Index] = oidx
+				name := tcd.Function.Name
+				callID := tcd.ID
+				if name == "" && tcd.Type != "" {
+					name = tcd.Type
+				}
+				fcEvent := converter.BuildStreamFunctionCallItemAddedEvent(itemID, name, callID, oidx)
+				fmt.Fprint(c.Writer, fcEvent)
+			}
+			// 发送 arguments delta
+			if tcd.Function.Arguments != "" {
+				oidx := fcOutputIndex[tcd.Index]
+				itemID := fcItemIDs[tcd.Index]
+				argEvent := converter.BuildStreamFunctionCallArgumentsDeltaEvent(itemID, tcd.Function.Arguments, oidx)
+				fmt.Fprint(c.Writer, argEvent)
+			}
+			// 累积 arguments
+			state.ToolCalls = append(state.ToolCalls, converter.StreamToolCall{
+				Index:     tcd.Index,
+				ID:        tcd.ID,
+				Name:      tcd.Function.Name,
+				Arguments: tcd.Function.Arguments,
+			})
 		}
 
+		// 处理文本 delta
 		if deltaText != "" {
+			if !state.ItemAdded {
+				state.MsgID = "msg_" + uuid.New().String()
+				state.TextOutputIndex = state.NextOutputIndex()
+				itemEvent := converter.BuildStreamItemAddedEvent(state.MsgID, "assistant", state.TextOutputIndex)
+				fmt.Fprint(c.Writer, itemEvent)
+				state.ItemAdded = true
+			}
 			state.HasContent = true
 			state.AccumulatedText += deltaText
-			deltaEvent := converter.BuildStreamTextDeltaEvent(state.MsgID, deltaText, state.OutputIndex, state.ContentIndex)
+			deltaEvent := converter.BuildStreamTextDeltaEvent(state.MsgID, deltaText, state.TextOutputIndex, 0)
 			fmt.Fprint(c.Writer, deltaEvent)
 		}
 
@@ -151,15 +188,95 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 		}
 
 		if finishReason != "" {
+			status := converter.MapFinishReason(&finishReason)
+
+			// 构建所有 output items
+			var output []map[string]interface{}
+
 			if state.HasContent {
-				doneEvent := converter.BuildStreamTextDoneEvent(state.MsgID, state.AccumulatedText, state.OutputIndex, state.ContentIndex)
+				doneEvent := converter.BuildStreamTextDoneEvent(state.MsgID, state.AccumulatedText, state.TextOutputIndex, 0)
 				fmt.Fprint(c.Writer, doneEvent)
+
+				contentArr := []map[string]interface{}{}
+				if state.AccumulatedText != "" {
+					contentArr = append(contentArr, map[string]interface{}{
+						"type":        "output_text",
+						"text":        state.AccumulatedText,
+						"annotations": []interface{}{},
+					})
+				}
+				msgItem := map[string]interface{}{
+					"id":      state.MsgID,
+					"type":    "message",
+					"role":    "assistant",
+					"content": contentArr,
+				}
+				output = append(output, msgItem)
+
+				// 发送 response.output_item.done 给 message
+				itemDoneEvent := converter.BuildStreamOutputItemDoneEvent(state.MsgID, state.TextOutputIndex, msgItem)
+				fmt.Fprint(c.Writer, itemDoneEvent)
 			}
 
-			status := converter.MapFinishReason(&finishReason)
+			// 合并 tool call arguments 并构建 function_call output items
+			type fcMerge struct {
+				ID        string
+				Index     int
+				ItemID    string
+				Name      string
+				Arguments string
+			}
+			mergeMap := map[int]*fcMerge{}
+			for _, tc := range state.ToolCalls {
+				if mergeMap[tc.Index] == nil {
+					mergeMap[tc.Index] = &fcMerge{
+						Index:  tc.Index,
+						ID:     tc.ID,
+						ItemID: fcItemIDs[tc.Index],
+						Name:   tc.Name,
+					}
+				}
+				mergeMap[tc.Index].Arguments += tc.Arguments
+				if tc.ID != "" {
+					mergeMap[tc.Index].ID = tc.ID
+				}
+				if tc.Name != "" {
+					mergeMap[tc.Index].Name = tc.Name
+				}
+			}
+			for _, m := range mergeMap {
+				callID := m.ID
+				if callID == "" {
+					callID = "call_" + uuid.New().String()
+				}
+				itemID := m.ItemID
+				if itemID == "" {
+					itemID = "fcall_" + uuid.New().String()
+				}
+				oidx := fcOutputIndex[m.Index]
+
+				// 发送 function_call_arguments.done
+				argDone := converter.BuildStreamFunctionCallArgumentsDoneEvent(itemID, m.Arguments, oidx)
+				fmt.Fprint(c.Writer, argDone)
+
+				fcItem := map[string]interface{}{
+					"id":        itemID,
+					"type":      "function_call",
+					"call_id":   callID,
+					"name":      m.Name,
+					"arguments": m.Arguments,
+					"status":    "completed",
+				}
+				output = append(output, fcItem)
+
+				// 发送 response.output_item.done 给 function_call
+				itemDoneEvent := converter.BuildStreamOutputItemDoneEvent(itemID, oidx, fcItem)
+				fmt.Fprint(c.Writer, itemDoneEvent)
+			}
+
 			completedEvent := converter.BuildStreamCompletedEvent(
 				state.RespID, state.Model, state.CreatedAt,
-				status, state.MsgID, state.AccumulatedText,
+				status, output,
 				state.PromptTokens, state.CompletionTokens,
 			)
 			fmt.Fprint(c.Writer, completedEvent)

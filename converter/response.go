@@ -87,24 +87,18 @@ func ConvertNonStreamingResponse(upstreamBody []byte) ([]byte, error) {
 func buildOutput(msg responseMessage) json.RawMessage {
 	var outputItems []json.RawMessage
 
-	msgID := "msg_" + uuid.New().String()
-
-	contentArr := []json.RawMessage{}
-	if msg.Content != nil {
+	if msg.Content != nil && *msg.Content != "" {
+		msgID := "msg_" + uuid.New().String()
 		contentItem := map[string]interface{}{
 			"type":        "output_text",
 			"text":        *msg.Content,
 			"annotations": []interface{}{},
 		}
-		contentArr = append(contentArr, mustJSON(contentItem))
-	}
-
-	if len(contentArr) > 0 {
 		messageItem := map[string]interface{}{
 			"id":      msgID,
 			"type":    "message",
 			"role":    "assistant",
-			"content": contentArr,
+			"content": []interface{}{contentItem},
 		}
 		outputItems = append(outputItems, mustJSON(messageItem))
 	}
@@ -224,26 +218,55 @@ func BuildStreamItemAddedEvent(itemID, role string, outputIndex int) string {
 	return fmt.Sprintf("data: %s\n\n", data)
 }
 
-func BuildStreamCompletedEvent(respID, model string, createdAt int64, status string, itemID, fullText string, promptTokens, completionTokens int) string {
-	contentArr := []map[string]interface{}{}
-	if fullText != "" {
-		contentArr = append(contentArr, map[string]interface{}{
-			"type":        "output_text",
-			"text":        fullText,
-			"annotations": []interface{}{},
-		})
+func BuildStreamFunctionCallItemAddedEvent(itemID, name, callID string, outputIndex int) string {
+	item := map[string]interface{}{
+		"id":        itemID,
+		"type":      "function_call",
+		"call_id":   callID,
+		"name":      name,
+		"arguments": "",
+		"status":    "in_progress",
 	}
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":         "response.output_item.added",
+		"item_id":      itemID,
+		"output_index": outputIndex,
+		"item":         item,
+	})
+	return fmt.Sprintf("data: %s\n\n", data)
+}
 
-	output := []map[string]interface{}{}
-	if itemID != "" {
-		output = append(output, map[string]interface{}{
-			"id":      itemID,
-			"type":    "message",
-			"role":    "assistant",
-			"content": contentArr,
-		})
-	}
+func BuildStreamFunctionCallArgumentsDeltaEvent(itemID, delta string, outputIndex int) string {
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":         "response.function_call_arguments.delta",
+		"delta":        delta,
+		"item_id":      itemID,
+		"output_index": outputIndex,
+	})
+	return fmt.Sprintf("data: %s\n\n", data)
+}
 
+func BuildStreamFunctionCallArgumentsDoneEvent(itemID, arguments string, outputIndex int) string {
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":         "response.function_call_arguments.done",
+		"arguments":    arguments,
+		"item_id":      itemID,
+		"output_index": outputIndex,
+	})
+	return fmt.Sprintf("data: %s\n\n", data)
+}
+
+func BuildStreamOutputItemDoneEvent(itemID string, outputIndex int, item map[string]interface{}) string {
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":         "response.output_item.done",
+		"item_id":      itemID,
+		"output_index": outputIndex,
+		"item":         item,
+	})
+	return fmt.Sprintf("data: %s\n\n", data)
+}
+
+func BuildStreamCompletedEvent(respID, model string, createdAt int64, status string, output []map[string]interface{}, promptTokens, completionTokens int) string {
 	resp := map[string]interface{}{
 		"id":         respID,
 		"object":     "response",
@@ -267,48 +290,71 @@ func BuildStreamCompletedEvent(respID, model string, createdAt int64, status str
 	return fmt.Sprintf("data: %s\n\n", data)
 }
 
+type StreamToolCall struct {
+	Index     int
+	ID        string
+	Name      string
+	Arguments string
+}
+
 type StreamState struct {
 	RespID           string
 	MsgID            string
 	Model            string
 	CreatedAt        int64
 	AccumulatedText  string
-	OutputIndex      int
-	ContentIndex     int
 	HasContent       bool
+	ItemAdded        bool
+	TextOutputIndex  int
 	PromptTokens     int
 	CompletionTokens int
+	ToolCalls        []StreamToolCall
+	nextOutputIndex  int
 }
 
 func NewStreamState(model string, createdAt int64) *StreamState {
 	return &StreamState{
-		RespID:       responsesIDPrefix + uuid.New().String(),
-		MsgID:        "msg_" + uuid.New().String(),
-		Model:        model,
-		CreatedAt:    createdAt,
-		OutputIndex:  0,
-		ContentIndex: 0,
+		RespID:    responsesIDPrefix + uuid.New().String(),
+		Model:     model,
+		CreatedAt: createdAt,
 	}
 }
 
-func ParseChatStreamLine(line string) (deltaText string, finishReason string, isDone bool, u *usage) {
+func (s *StreamState) NextOutputIndex() int {
+	idx := s.nextOutputIndex
+	s.nextOutputIndex++
+	return idx
+}
+
+type toolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function"`
+}
+
+func ParseChatStreamLine(line string) (deltaText string, finishReason string, isDone bool, u *usage, toolCalls []toolCallDelta) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
-		return "", "", false, nil
+		return "", "", false, nil, nil
 	}
 	if trimmed == "data: [DONE]" {
-		return "", "", true, nil
+		return "", "", true, nil, nil
 	}
 
 	if !strings.HasPrefix(trimmed, "data: ") {
-		return "", "", false, nil
+		return "", "", false, nil, nil
 	}
 
 	dataStr := strings.TrimPrefix(trimmed, "data: ")
 	var chunk struct {
 		Choices []struct {
 			Delta struct {
-				Content string `json:"content"`
+				Content   string          `json:"content"`
+				ToolCalls json.RawMessage `json:"tool_calls"`
 			} `json:"delta"`
 			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
@@ -316,7 +362,7 @@ func ParseChatStreamLine(line string) (deltaText string, finishReason string, is
 	}
 
 	if err := json.Unmarshal([]byte(dataStr), &chunk); err != nil {
-		return "", "", false, nil
+		return "", "", false, nil, nil
 	}
 
 	u = chunk.Usage
@@ -326,7 +372,11 @@ func ParseChatStreamLine(line string) (deltaText string, finishReason string, is
 		if chunk.Choices[0].FinishReason != nil {
 			finishReason = *chunk.Choices[0].FinishReason
 		}
+
+		if chunk.Choices[0].Delta.ToolCalls != nil {
+			json.Unmarshal(chunk.Choices[0].Delta.ToolCalls, &toolCalls)
+		}
 	}
 
-	return deltaText, finishReason, false, u
+	return deltaText, finishReason, false, u, toolCalls
 }

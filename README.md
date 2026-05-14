@@ -5,6 +5,13 @@
 
 OpenAI Responses API 代理 — 将 `/v1/responses` 请求转换为 `/v1/chat/completions` 请求并转发到上游服务。
 
+## 功能
+
+- **请求转换**：Responses API → Chat Completions API
+- **流式响应**：SSE 事件格式转换（`response.created`、`output_text.delta`、`function_call_arguments.delta`、`output_item.done`、`response.completed`）
+- **工具调用**：支持 `tools` 参数和 `function_call_output` 输入转换
+- **内置工具映射**：`web_search` 等内置工具自动映射为 function 格式
+
 ## 架构
 
 ```
@@ -110,6 +117,8 @@ curl -X POST http://localhost:8082/v1/responses \
 
 ### 响应格式
 
+#### 纯文本
+
 ```json
 {
   "id": "resp_abc123",
@@ -142,15 +151,65 @@ curl -X POST http://localhost:8082/v1/responses \
 }
 ```
 
+#### 含工具调用
+
+```json
+{
+  "id": "resp_abc123",
+  "object": "response",
+  "status": "completed",
+  "output": [
+    {
+      "id": "msg_abc123",
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "让我来搜索一下。",
+          "annotations": []
+        }
+      ]
+    },
+    {
+      "id": "fcall_abc123",
+      "type": "function_call",
+      "call_id": "call_xxx",
+      "name": "web_search",
+      "arguments": "{\"query\": \"OpenHarness project\"}",
+      "status": "completed"
+    }
+  ]
+}
+```
+
+### 工具调用
+
+支持工具（tools）的请求转换和流式响应：
+
+```bash
+curl -N -X POST http://localhost:8082/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "big-pickle",
+    "input": "搜索一下 OpenHarness 项目",
+    "tools": [
+      {"type": "web_search", "name": "web_search"}
+    ],
+    "stream": true
+  }'
+```
+
 ## 请求转换说明
 
 | Responses API | Chat Completions API |
-|---|---|
+|---|---|---|
 | `input` (string) | → `messages: [{role:"user", content: <input>}]` |
-| `input` (array) | → `messages`（过滤 message 类型 item，role 映射） |
+| `input` (array) | → `messages`（过滤 message 类型 item，role 映射，`function_call_output` → `user` 角色） |
 | `instructions` | → `messages` 头部插入 system message |
 | `max_output_tokens` | → `max_tokens` |
 | `text.format` | → `response_format` |
+| `tools` | → `tools`（内置工具映射，如 `web_search`） |
 
 ## 日志
 
