@@ -274,3 +274,66 @@ opencode_openai_proxy/
 │   └── responses_test.go # 路径路由测试
 └── .env                 # 环境变量（gitignored）
 ```
+
+
+## 测试用例
+
+#### opencode_openai_proxy
+```
+curl -X POST http://127.0.0.1:8082/v1/responses \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer public" \
+-d '{
+	"model": "big-pickle",
+	"input": "你好",
+	"stream": false
+}'
+
+
+curl -X POST http://127.0.0.1:8082/opencode/v1/responses \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer public" \
+-d '{
+	"model": "big-pickle",
+	"input": "你好",
+	"stream": false
+}'
+
+
+curl -X POST http://127.0.0.1:8082/ollama/v1/responses \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer public" \
+-d '{
+	"model": "gemma4:26b",
+	"input": "你好",
+	"stream": false
+}'
+```
+
+####  sub2api
+```
+curl -X POST http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer sk-9764b2271063972148950ae10a61bb1e7fad117c5c8f0e259cf3a29afc10207d" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.4",
+    "input": "你好",
+    "stream": false
+ }'
+```
+
+#### opencode
+```
+curl -X POST "https://opencode.ai/zen/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer public" \
+  -d '{
+      "model": "big-pickle",
+      "messages": [
+      {
+        "role": "user",
+        "content": "你好"
+      }
+    ]
+  }'
+ ```
