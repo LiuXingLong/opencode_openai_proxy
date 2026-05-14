@@ -63,11 +63,35 @@ UPSTREAM_BASE_URL=https://your-upstream.com/zen docker compose up -d
 
 ## 配置
 
+支持 `.env` 文件或环境变量。
+
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `UPSTREAM_BASE_URL` | `https://opencode.ai/zen` | 上游 Chat Completions 服务地址 |
+| `UPSTREAM_BASE_URL` | `https://opencode.ai/zen` | 默认上游 Chat Completions 服务地址 |
+| `UPSTREAM_ROUTES` | - | 按路径前缀分发的路由表，JSON 格式。最长前缀匹配，未匹配时回退到 `UPSTREAM_BASE_URL` |
 | `LISTEN_ADDR` | `:8082` | 代理监听地址 |
 | `LOG_FILE` | `./logs/proxy.log` | 日志文件路径 |
+
+### 路径路由
+
+`UPSTREAM_ROUTES` 可将不同请求路径转发到不同上游：
+
+```bash
+# .env
+UPSTREAM_ROUTES={"/v1/responses":"https://opencode.ai/zen","/ollama/v1/responses":"http://127.0.0.1:11434"}
+```
+
+```bash
+# /v1/responses → 默认或 /v1 上游
+curl -X POST http://localhost:8082/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"big-pickle","input":"你好","stream":false}'
+
+# /ollama/v1/responses → ollama 本地服务
+curl -X POST http://localhost:8082/ollama/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-oss:20b","input":"你好","stream":false}'
+```
 
 ## API 使用
 
@@ -233,7 +257,7 @@ opencode_openai_proxy/
 ├── manage.sh            # 管理脚本（build/start/stop/restart/reopen）
 ├── Dockerfile           # Docker 镜像构建
 ├── docker-compose.yml   # Docker Compose 编排
-├── config/config.go     # 配置
+├── config/config.go     # 配置（支持 .env）
 ├── logger/logger.go     # 日志（slog JSON + 文件，自动重建）
 ├── middleware/
 │   ├── trace.go         # traceID
@@ -241,8 +265,12 @@ opencode_openai_proxy/
 ├── converter/
 │   ├── request.go       # 请求转换
 │   └── response.go      # 响应转换（非流式 + 流式）
-├── proxy/proxy.go       # 上游转发
-└── handler/
-    ├── responses.go     # /v1/responses 端点
-    └── health.go        # /health 端点
+├── proxy/proxy.go       # 上游转发（含路径路由选择）
+├── handler/
+│   ├── responses.go     # /v1/responses 端点
+│   └── health.go        # /health 端点
+├── test/
+│   ├── auth_test.go     # 认证中间件测试
+│   └── responses_test.go # 路径路由测试
+└── .env                 # 环境变量（gitignored）
 ```

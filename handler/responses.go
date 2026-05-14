@@ -58,7 +58,7 @@ func (h *ResponsesHandler) Create(c *gin.Context) {
 
 	authHeader := middleware.GetAuthHeader(c)
 
-	upstreamResp, err := h.Proxy.Send(c.Request.Context(), chatReqBody, authHeader)
+	upstreamResp, err := h.Proxy.Send(c.Request.Context(), c.Request.URL.Path, chatReqBody, authHeader)
 	if err != nil {
 		l.Error("upstream request failed", "error", err.Error())
 		c.JSON(http.StatusBadGateway, gin.H{"error": "upstream request failed"})

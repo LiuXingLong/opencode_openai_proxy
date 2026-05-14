@@ -13,9 +13,12 @@ import (
 	"github.com/LiuXingLong/opencode-openai-proxy/middleware"
 	"github.com/LiuXingLong/opencode-openai-proxy/proxy"
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	godotenv.Load()
+
 	cfg := config.Load()
 
 	l, err := logger.Init(cfg.LogFile)
@@ -30,10 +33,17 @@ func main() {
 	r.Use(middleware.Trace())
 	r.Use(middleware.Auth())
 
-	p := proxy.New(cfg.UpstreamBaseURL)
+	p := proxy.New(cfg.UpstreamBaseURL, cfg.RouteMap)
 	h := handler.NewResponsesHandler(p)
 
-	r.POST("/v1/responses", h.Create)
+	// 注册路由表中的路径 + 默认 /v1/responses
+	registered := map[string]bool{"/v1/responses": true}
+	for path := range cfg.RouteMap {
+		registered[path] = true
+	}
+	for path := range registered {
+		r.POST(path, h.Create)
+	}
 	r.GET("/health", handler.Health)
 
 	go func() {
@@ -51,6 +61,7 @@ func main() {
 	l.Info("server starting",
 		"addr", cfg.ListenAddr,
 		"upstream", cfg.UpstreamBaseURL,
+		"routes", cfg.RouteMap,
 		"log_file", cfg.LogFile,
 	)
 

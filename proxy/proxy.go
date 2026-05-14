@@ -6,27 +6,46 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/LiuXingLong/opencode-openai-proxy/logger"
 )
 
 type Proxy struct {
-	baseURL string
-	client  *http.Client
+	defaultBaseURL string
+	routeMap       map[string]string
+	client         *http.Client
 }
 
-func New(baseURL string) *Proxy {
+func New(defaultBaseURL string, routeMap map[string]string) *Proxy {
 	return &Proxy{
-		baseURL: baseURL,
+		defaultBaseURL: defaultBaseURL,
+		routeMap:       routeMap,
 		client: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
 	}
 }
 
-func (p *Proxy) Send(ctx context.Context, body []byte, authHeader string) (*http.Response, error) {
-	upstreamURL := p.baseURL + "/v1/chat/completions"
+func (p *Proxy) selectBaseURL(path string) string {
+	var matchedURL string
+	var matchedLen int
+	for prefix, url := range p.routeMap {
+		if strings.HasPrefix(path, prefix) && len(prefix) > matchedLen {
+			matchedURL = url
+			matchedLen = len(prefix)
+		}
+	}
+	if matchedURL == "" {
+		return p.defaultBaseURL
+	}
+	return matchedURL
+}
+
+func (p *Proxy) Send(ctx context.Context, path string, body []byte, authHeader string) (*http.Response, error) {
+	baseURL := p.selectBaseURL(path)
+	upstreamURL := baseURL + "/v1/chat/completions"
 	l := logger.FromContext(ctx)
 
 	l.Info("upstream request",

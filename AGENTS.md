@@ -18,16 +18,17 @@ GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go buil
 # 直接运行（开发时）
 GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go run .
 
-# 运行测试（目前没有测试文件，添加后可用）
-# GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go test ./...
-# GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go test -run TestName ./converter
+# 运行测试
+GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go test -v ./test/
+GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go test -v -run TestName ./test/
 
 # 安装依赖
 GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go mod tidy
 ```
 
-环境变量配置（见 `config/config.go`）：
-- `UPSTREAM_BASE_URL` — 上游地址，默认 `https://opencode.ai/zen`
+环境变量配置（见 `config/config.go`，支持 `.env` 文件）：
+- `UPSTREAM_BASE_URL` — 默认上游地址，默认 `https://opencode.ai/zen`
+- `UPSTREAM_ROUTES` — 按路径前缀分发的路由表，JSON 格式，如 `{"/v1/responses":"https://upstream-a.com","/v1":"https://upstream-b.com"}`。最长前缀匹配，未匹配时回退到 `UPSTREAM_BASE_URL`
 - `LISTEN_ADDR` — 监听地址，默认 `:8082`
 - `LOG_FILE` — 日志文件路径，默认 `./logs/proxy.log`
 
@@ -46,9 +47,13 @@ GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go mod 
 ├── middleware/             # Gin 中间件
 │   ├── auth.go             # 认证（透传 Authorization，默认 Bearer public）
 │   └── trace.go            # 追踪（trace_id 注入到 context 和响应头）
-├── proxy/proxy.go          # 上游 HTTP 客户端
+├── proxy/proxy.go          # 上游 HTTP 客户端（含路径路由选择）
 ├── logger/logger.go        # JSON 日志（文件+stderr 双写，支持 SIGHUP 重开）
+├── test/                   # 集成测试
+│   ├── auth_test.go        # 认证中间件测试
+│   └── responses_test.go   # 路径路由测试
 ├── manage.sh               # 管理脚本
+├── .env                    # 环境变量配置（gitignored）
 └── logs/proxy.log          # 日志文件（gitignored）
 ```
 
