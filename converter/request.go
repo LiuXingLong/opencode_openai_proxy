@@ -140,6 +140,18 @@ func convertInput(raw json.RawMessage) ([]Message, error) {
 			})
 			continue
 		}
+		if item.Type == "web_search_call" {
+			output := item.Output
+			if output == "" {
+				continue
+			}
+			text := "Web search results:\n" + output
+			msgs = append(msgs, Message{
+				Role:    "user",
+				Content: mustJSON(text),
+			})
+			continue
+		}
 		if item.Type != "" && item.Type != "message" {
 			continue
 		}
@@ -265,6 +277,47 @@ func convertTools(raw json.RawMessage) json.RawMessage {
 
 	b, _ := json.Marshal(converted)
 	return b
+}
+
+func BuildReInvokeRequest(originalBody []byte, query string, resultsJSON json.RawMessage, toolCallID string) ([]byte, error) {
+	var orig map[string]interface{}
+	if err := json.Unmarshal(originalBody, &orig); err != nil {
+		return nil, fmt.Errorf("parse original request: %w", err)
+	}
+
+	model, _ := orig["model"].(string)
+	stream, _ := orig["stream"].(bool)
+
+	wrapper := fmt.Sprintf(`请根据以下搜索结果回答用户的问题，不要依赖你自身的知识。
+
+要求：
+1. 逐条分析每条搜索结果，从中提取有用的信息
+2. 忽略与问题无关的搜索结果，不要因为无关结果而认为信息不足
+3. 将所有有用信息汇总整理，形成完整的回答
+4. 如果所有搜索结果都与问题无关，请仅回复：
+SEARCH_RESULT_INSUFFICIENT: 简短说明原因
+
+搜索结果（JSON格式）：
+%s`, string(resultsJSON))
+	messages := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": wrapper,
+		},
+	}
+
+	body := map[string]interface{}{
+		"model":    model,
+		"messages": messages,
+		"stream":   stream,
+	}
+	for _, key := range []string{"temperature", "max_tokens", "top_p", "stop", "frequency_penalty", "presence_penalty", "response_format"} {
+		if v, ok := orig[key]; ok {
+			body[key] = v
+		}
+	}
+
+	return json.Marshal(body)
 }
 
 func jsonEscape(s string) string {

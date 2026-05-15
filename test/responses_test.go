@@ -13,6 +13,7 @@ import (
 	"github.com/LiuXingLong/opencode-openai-proxy/handler"
 	"github.com/LiuXingLong/opencode-openai-proxy/middleware"
 	"github.com/LiuXingLong/opencode-openai-proxy/proxy"
+	"github.com/LiuXingLong/opencode-openai-proxy/searcher"
 )
 
 func chatResponse(id, content string) string {
@@ -82,7 +83,8 @@ func TestPathRoutingDefaultUpstream(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p)
+	s := searcher.New(0, 0, "", 0)
+	h := handler.NewResponsesHandler(p, s, 3)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -131,7 +133,7 @@ func TestPathRoutingOllamaUpstream(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0), 3)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -180,7 +182,7 @@ func TestPathRoutingOllamaUpstreamWrongPath(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0), 3)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -217,7 +219,7 @@ func TestPathRoutingNotFound(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0), 3)
 
 	r := gin.New()
 	r.Use(gin.Recovery())

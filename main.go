@@ -7,11 +7,14 @@ import (
 	"os/signal"
 	"syscall"
 
+	"time"
+
 	"github.com/LiuXingLong/opencode-openai-proxy/config"
 	"github.com/LiuXingLong/opencode-openai-proxy/handler"
 	"github.com/LiuXingLong/opencode-openai-proxy/logger"
 	"github.com/LiuXingLong/opencode-openai-proxy/middleware"
 	"github.com/LiuXingLong/opencode-openai-proxy/proxy"
+	"github.com/LiuXingLong/opencode-openai-proxy/searcher"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
@@ -34,7 +37,8 @@ func main() {
 	r.Use(middleware.Auth())
 
 	p := proxy.New(cfg.UpstreamBaseURL, cfg.RouteMap)
-	h := handler.NewResponsesHandler(p)
+	s := searcher.New(cfg.SearchResultCount, time.Duration(cfg.SearchTimeout)*time.Second, cfg.SearchBingURL, cfg.SearchConcurrency)
+	h := handler.NewResponsesHandler(p, s, cfg.SearchRetryCount)
 
 	// 注册路由表中的路径 + 默认 /v1/responses
 	registered := map[string]bool{"/v1/responses": true}

@@ -56,6 +56,15 @@ type outputTokensDetails struct {
 	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
+// 与 request.go 的 builtinToolMapping key 保持一致
+var builtinToolNames = map[string]bool{
+	"web_search": true,
+}
+
+func IsBuiltinTool(name string) bool {
+	return builtinToolNames[name]
+}
+
 const responsesIDPrefix = "resp_"
 
 func ConvertNonStreamingResponse(upstreamBody []byte) ([]byte, error) {
@@ -114,13 +123,34 @@ func buildOutput(msg responseMessage) json.RawMessage {
 		}
 		if err := json.Unmarshal(msg.ToolCalls, &toolCalls); err == nil {
 			for _, tc := range toolCalls {
-				fcItem := map[string]interface{}{
-					"id":        tc.ID,
-					"type":      "function_call",
-					"call_id":   tc.ID,
-					"name":      tc.Function.Name,
-					"arguments": tc.Function.Arguments,
-					"status":    "completed",
+				var fcItem map[string]interface{}
+				if IsBuiltinTool(tc.Function.Name) {
+					var searchArgs struct {
+						Query string `json:"query"`
+					}
+					json.Unmarshal([]byte(tc.Function.Arguments), &searchArgs)
+					action := map[string]interface{}{
+						"type": "search",
+					}
+					if searchArgs.Query != "" {
+						action["query"] = searchArgs.Query
+						action["queries"] = []string{searchArgs.Query}
+					}
+					fcItem = map[string]interface{}{
+						"id":     "ws_" + uuid.New().String(),
+						"type":   tc.Function.Name + "_call",
+						"status": "completed",
+						"action": action,
+					}
+				} else {
+					fcItem = map[string]interface{}{
+						"id":        tc.ID,
+						"type":      "function_call",
+						"call_id":   tc.ID,
+						"name":      tc.Function.Name,
+						"arguments": tc.Function.Arguments,
+						"status":    "completed",
+					}
 				}
 				outputItems = append(outputItems, mustJSON(fcItem))
 			}
@@ -226,6 +256,21 @@ func BuildStreamFunctionCallItemAddedEvent(itemID, name, callID string, outputIn
 		"name":      name,
 		"arguments": "",
 		"status":    "in_progress",
+	}
+	data, _ := json.Marshal(map[string]interface{}{
+		"type":         "response.output_item.added",
+		"item_id":      itemID,
+		"output_index": outputIndex,
+		"item":         item,
+	})
+	return fmt.Sprintf("data: %s\n\n", data)
+}
+
+func BuildStreamBuiltinToolItemAddedEvent(itemID, toolType string, outputIndex int) string {
+	item := map[string]interface{}{
+		"id":     itemID,
+		"type":   toolType,
+		"status": "in_progress",
 	}
 	data, _ := json.Marshal(map[string]interface{}{
 		"type":         "response.output_item.added",

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,15 +16,18 @@ import (
 	"github.com/LiuXingLong/opencode-openai-proxy/logger"
 	"github.com/LiuXingLong/opencode-openai-proxy/middleware"
 	"github.com/LiuXingLong/opencode-openai-proxy/proxy"
+	"github.com/LiuXingLong/opencode-openai-proxy/searcher"
 	"github.com/gin-gonic/gin"
 )
 
 type ResponsesHandler struct {
-	Proxy *proxy.Proxy
+	Proxy      *proxy.Proxy
+	Searcher   *searcher.Searcher
+	retryCount int
 }
 
-func NewResponsesHandler(p *proxy.Proxy) *ResponsesHandler {
-	return &ResponsesHandler{Proxy: p}
+func NewResponsesHandler(p *proxy.Proxy, s *searcher.Searcher, retryCount int) *ResponsesHandler {
+	return &ResponsesHandler{Proxy: p, Searcher: s, retryCount: retryCount}
 }
 
 func (h *ResponsesHandler) Create(c *gin.Context) {
@@ -77,17 +81,76 @@ func (h *ResponsesHandler) Create(c *gin.Context) {
 	}
 
 	if reqMeta.Stream {
-		h.handleStreaming(c, upstreamResp.Body, reqMeta.Model, start, l)
+		h.handleStreaming(c, upstreamResp.Body, chatReqBody, authHeader, start, l)
 	} else {
-		h.handleNonStreaming(c, upstreamResp.Body, start, l)
+		h.handleNonStreaming(c, upstreamResp.Body, chatReqBody, authHeader, start, l)
 	}
 }
 
-func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Reader, start time.Time, l *slog.Logger) {
+func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Reader, originalBody []byte, authHeader string, start time.Time, l *slog.Logger) {
 	rawBody, err := io.ReadAll(upstreamBody)
 	if err != nil {
 		l.Error("read upstream response body failed", "error", err.Error())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read upstream response failed"})
+		return
+	}
+
+	toolCallID, query := extractWebSearchToolCall(rawBody)
+	if toolCallID != "" {
+		var finalMsgText string
+		totalAttempts := h.retryCount + 1
+
+		for attempt := 0; attempt < totalAttempts; attempt++ {
+			if attempt > 0 {
+				l.Info("search: retrying", "query", query, "attempt", attempt+1, "max", totalAttempts)
+			}
+
+			results := h.Searcher.Search(c.Request.Context(), query)
+
+			if len(results) > 0 {
+				searchTime := time.Now().Format("2006-01-02 15:04")
+				resultsJSON, _ := json.Marshal(map[string]interface{}{
+					"query":       query,
+					"search_time": searchTime,
+					"results":     results,
+				})
+				l.Info("search: feeding results to model",
+					"query", query,
+					"result_count", len(results),
+					"results_json", string(resultsJSON),
+				)
+
+				reInvokeBody, err := converter.BuildReInvokeRequest(originalBody, query, resultsJSON, toolCallID)
+				if err == nil {
+					reInvokeResp, err := h.Proxy.Send(c.Request.Context(), c.Request.URL.Path, reInvokeBody, authHeader)
+					if err == nil && reInvokeResp.StatusCode == http.StatusOK {
+						reInvokeRaw, _ := io.ReadAll(reInvokeResp.Body)
+						reInvokeResp.Body.Close()
+						finalMsgText = extractContentFromResponse(reInvokeRaw)
+						if finalMsgText != "" && !strings.HasPrefix(finalMsgText, "SEARCH_RESULT_INSUFFICIENT") {
+							break
+						}
+						if strings.HasPrefix(finalMsgText, "SEARCH_RESULT_INSUFFICIENT") {
+							l.Info("search: model reported insufficient results",
+								"query", query, "attempt", attempt, "response", finalMsgText)
+						}
+					}
+				}
+			}
+		}
+
+		l.Info("search: re-invoke response",
+			"query", query,
+			"response_text", finalMsgText,
+		)
+
+		converted := buildSearchResponse(rawBody, finalMsgText)
+		l.Info("outgoing response",
+			"status", http.StatusOK,
+			"duration", time.Since(start).String(),
+			"body", string(converted),
+		)
+		c.Data(http.StatusOK, "application/json", converted)
 		return
 	}
 
@@ -107,8 +170,8 @@ func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Re
 	c.Data(http.StatusOK, "application/json", converted)
 }
 
-func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reader, model string, start time.Time, l *slog.Logger) {
-	state := converter.NewStreamState(model, time.Now().Unix())
+func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reader, originalBody []byte, authHeader string, start time.Time, l *slog.Logger) {
+	state := converter.NewStreamState("", time.Now().Unix())
 
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
@@ -122,16 +185,15 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 	scanner := bufio.NewScanner(upstreamBody)
 	scanner.Buffer(make([]byte, 0, 1024*64), 1024*1024)
 
-	// 按 index 记录已添加的 function_call item（避免重复发送 item_added）
 	addedFCIndexes := map[int]bool{}
 	fcItemIDs := map[int]string{}
 	fcOutputIndex := map[int]int{}
+	fcIsBuiltin := map[int]bool{}
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		deltaText, finishReason, isDone, upstreamUsage, toolCallDeltas := converter.ParseChatStreamLine(line)
 
-		// 记录上游返回的每个非空 chunk
 		if deltaText != "" || len(toolCallDeltas) > 0 || finishReason != "" || upstreamUsage != nil {
 			l.Debug("upstream stream chunk",
 				"delta_text", deltaText,
@@ -145,12 +207,9 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 			break
 		}
 
-		// 处理 tool_calls deltas
 		for _, tcd := range toolCallDeltas {
 			if !addedFCIndexes[tcd.Index] {
 				addedFCIndexes[tcd.Index] = true
-				itemID := "fcall_" + uuid.New().String()
-				fcItemIDs[tcd.Index] = itemID
 				oidx := state.NextOutputIndex()
 				fcOutputIndex[tcd.Index] = oidx
 				name := tcd.Function.Name
@@ -158,17 +217,26 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 				if name == "" && tcd.Type != "" {
 					name = tcd.Type
 				}
-				fcEvent := converter.BuildStreamFunctionCallItemAddedEvent(itemID, name, callID, oidx)
-				fmt.Fprint(c.Writer, fcEvent)
+				isBuiltin := converter.IsBuiltinTool(name)
+				fcIsBuiltin[tcd.Index] = isBuiltin
+				if isBuiltin {
+					itemID := "ws_" + uuid.New().String()
+					fcItemIDs[tcd.Index] = itemID
+					fcEvent := converter.BuildStreamBuiltinToolItemAddedEvent(itemID, name+"_call", oidx)
+					fmt.Fprint(c.Writer, fcEvent)
+				} else {
+					itemID := "fcall_" + uuid.New().String()
+					fcItemIDs[tcd.Index] = itemID
+					fcEvent := converter.BuildStreamFunctionCallItemAddedEvent(itemID, name, callID, oidx)
+					fmt.Fprint(c.Writer, fcEvent)
+				}
 			}
-			// 发送 arguments delta
-			if tcd.Function.Arguments != "" {
+			if tcd.Function.Arguments != "" && !fcIsBuiltin[tcd.Index] {
 				oidx := fcOutputIndex[tcd.Index]
 				itemID := fcItemIDs[tcd.Index]
 				argEvent := converter.BuildStreamFunctionCallArgumentsDeltaEvent(itemID, tcd.Function.Arguments, oidx)
 				fmt.Fprint(c.Writer, argEvent)
 			}
-			// 累积 arguments
 			state.ToolCalls = append(state.ToolCalls, converter.StreamToolCall{
 				Index:     tcd.Index,
 				ID:        tcd.ID,
@@ -177,7 +245,6 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 			})
 		}
 
-		// 处理文本 delta
 		if deltaText != "" {
 			if !state.ItemAdded {
 				state.MsgID = "msg_" + uuid.New().String()
@@ -200,7 +267,6 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 		if finishReason != "" {
 			status := converter.MapFinishReason(&finishReason)
 
-			// 构建所有 output items
 			var output []map[string]interface{}
 
 			if state.HasContent {
@@ -223,12 +289,10 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 				}
 				output = append(output, msgItem)
 
-				// 发送 response.output_item.done 给 message
 				itemDoneEvent := converter.BuildStreamOutputItemDoneEvent(state.MsgID, state.TextOutputIndex, msgItem)
 				fmt.Fprint(c.Writer, itemDoneEvent)
 			}
 
-			// 合并 tool call arguments 并构建 function_call output items
 			type fcMerge struct {
 				ID        string
 				Index     int
@@ -254,34 +318,199 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 					mergeMap[tc.Index].Name = tc.Name
 				}
 			}
+
 			for _, m := range mergeMap {
-				callID := m.ID
-				if callID == "" {
-					callID = "call_" + uuid.New().String()
-				}
 				itemID := m.ItemID
 				if itemID == "" {
 					itemID = "fcall_" + uuid.New().String()
 				}
 				oidx := fcOutputIndex[m.Index]
+				isBuiltin := fcIsBuiltin[m.Index]
 
-				// 发送 function_call_arguments.done
-				argDone := converter.BuildStreamFunctionCallArgumentsDoneEvent(itemID, m.Arguments, oidx)
-				fmt.Fprint(c.Writer, argDone)
-
-				fcItem := map[string]interface{}{
-					"id":        itemID,
-					"type":      "function_call",
-					"call_id":   callID,
-					"name":      m.Name,
-					"arguments": m.Arguments,
-					"status":    "completed",
+				var fcItem map[string]interface{}
+				if isBuiltin {
+					var searchArgs struct {
+						Query string `json:"query"`
+					}
+					json.Unmarshal([]byte(m.Arguments), &searchArgs)
+					action := map[string]interface{}{
+						"type": "search",
+					}
+					if searchArgs.Query != "" {
+						action["query"] = searchArgs.Query
+						action["queries"] = []string{searchArgs.Query}
+					}
+					fcItem = map[string]interface{}{
+						"id":     itemID,
+						"type":   m.Name + "_call",
+						"status": "completed",
+						"action": action,
+					}
+				} else {
+					callID := m.ID
+					if callID == "" {
+						callID = "call_" + uuid.New().String()
+					}
+					fcItem = map[string]interface{}{
+						"id":        itemID,
+						"type":      "function_call",
+						"call_id":   callID,
+						"name":      m.Name,
+						"arguments": m.Arguments,
+						"status":    "completed",
+					}
+					argDone := converter.BuildStreamFunctionCallArgumentsDoneEvent(itemID, m.Arguments, oidx)
+					fmt.Fprint(c.Writer, argDone)
 				}
+
 				output = append(output, fcItem)
 
-				// 发送 response.output_item.done 给 function_call
 				itemDoneEvent := converter.BuildStreamOutputItemDoneEvent(itemID, oidx, fcItem)
 				fmt.Fprint(c.Writer, itemDoneEvent)
+			}
+
+			// 检查是否所有 tool calls 都是 web_search
+			allWebSearch := len(mergeMap) > 0
+			for _, m := range mergeMap {
+				if !fcIsBuiltin[m.Index] {
+					allWebSearch = false
+					break
+				}
+			}
+
+			if allWebSearch {
+				// 取 query
+				var searchQuery string
+				var searchCallID string
+				for _, m := range mergeMap {
+					searchCallID = m.ID
+					var args struct {
+						Query string `json:"query"`
+					}
+					json.Unmarshal([]byte(m.Arguments), &args)
+					if args.Query != "" {
+						searchQuery = args.Query
+						break
+					}
+				}
+
+				if searchQuery != "" {
+					var accumulatedText string
+					totalAttempts := h.retryCount + 1
+					gotAnswer := false
+
+					for attempt := 0; attempt < totalAttempts; attempt++ {
+						if attempt > 0 {
+							l.Info("search: retrying", "query", searchQuery, "attempt", attempt+1, "max", totalAttempts)
+						}
+
+						results := h.Searcher.Search(c.Request.Context(), searchQuery)
+						if len(results) == 0 {
+							continue
+						}
+
+						resultsJSON, _ := json.Marshal(map[string]interface{}{
+							"query":       searchQuery,
+							"search_time": time.Now().Format("2006-01-02 15:04"),
+							"results":     results,
+						})
+						l.Info("search: feeding results to model",
+							"query", searchQuery,
+							"result_count", len(results),
+							"results_json", string(resultsJSON),
+						)
+
+						reInvokeBody, err := converter.BuildReInvokeRequest(originalBody, searchQuery, resultsJSON, searchCallID)
+						if err != nil {
+							continue
+						}
+
+						reInvokeResp, err := h.Proxy.Send(c.Request.Context(), c.Request.URL.Path, reInvokeBody, authHeader)
+						if err != nil || reInvokeResp.StatusCode != http.StatusOK {
+							if reInvokeResp != nil {
+								reInvokeResp.Body.Close()
+							}
+							continue
+						}
+
+						reInvokeScanner := bufio.NewScanner(reInvokeResp.Body)
+						reInvokeScanner.Buffer(make([]byte, 0, 1024*64), 1024*1024)
+
+						accumulatedText = ""
+						for reInvokeScanner.Scan() {
+							rt, rFinish, _, _, _ := converter.ParseChatStreamLine(reInvokeScanner.Text())
+							if rt != "" {
+								accumulatedText += rt
+							}
+							if rFinish != "" {
+								break
+							}
+						}
+						reInvokeResp.Body.Close()
+
+						l.Info("search: re-invoke response",
+							"query", searchQuery,
+							"attempt", attempt,
+							"response_text", accumulatedText,
+						)
+
+						if accumulatedText != "" && !strings.HasPrefix(accumulatedText, "SEARCH_RESULT_INSUFFICIENT") {
+							gotAnswer = true
+							break
+						}
+						if strings.HasPrefix(accumulatedText, "SEARCH_RESULT_INSUFFICIENT") {
+							l.Info("search: model reported insufficient results",
+								"query", searchQuery, "attempt", attempt, "response", accumulatedText)
+						}
+					}
+
+					if gotAnswer {
+						msgID := "msg_" + uuid.New().String()
+						msgOidx := state.NextOutputIndex()
+
+						msgAddEvent := converter.BuildStreamItemAddedEvent(msgID, "assistant", msgOidx)
+						fmt.Fprint(c.Writer, msgAddEvent)
+
+						if accumulatedText != "" {
+							deltaEvent := converter.BuildStreamTextDeltaEvent(msgID, accumulatedText, msgOidx, 0)
+							fmt.Fprint(c.Writer, deltaEvent)
+						}
+
+						doneEvent := converter.BuildStreamTextDoneEvent(msgID, accumulatedText, msgOidx, 0)
+						fmt.Fprint(c.Writer, doneEvent)
+
+						contentArr := []map[string]interface{}{}
+						if accumulatedText != "" {
+							contentArr = append(contentArr, map[string]interface{}{
+								"type":        "output_text",
+								"text":        accumulatedText,
+								"annotations": []interface{}{},
+							})
+						}
+						msgItem := map[string]interface{}{
+							"id":      msgID,
+							"type":    "message",
+							"role":    "assistant",
+							"content": contentArr,
+						}
+						msgDoneEvent := converter.BuildStreamOutputItemDoneEvent(msgID, msgOidx, msgItem)
+						fmt.Fprint(c.Writer, msgDoneEvent)
+						output = append(output, msgItem)
+					} else {
+						fallbackText := "当前未搜索到相关信息，请调整查询词后重试。"
+						l.Warn("search: all retries exhausted, using fallback",
+							"query", searchQuery,
+							"fallback", fallbackText,
+						)
+						output = append(output, appendFallbackMessage(c, state, fallbackText)...)
+					}
+				} else {
+					l.Warn("search: empty query, using fallback",
+						"query", searchQuery,
+					)
+					fallbackText := "当前未搜索到相关信息，请调整查询词后重试。"
+					output = append(output, appendFallbackMessage(c, state, fallbackText)...)
+				}
 			}
 
 			l.Info("sending response.completed",
@@ -314,4 +543,173 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 		"tool_call_count", len(state.ToolCalls),
 		"usage", fmt.Sprintf(`{"input_tokens":%d,"output_tokens":%d}`, state.PromptTokens, state.CompletionTokens),
 	)
+}
+
+func appendFallbackMessage(c *gin.Context, state *converter.StreamState, text string) []map[string]interface{} {
+	msgID := "msg_" + uuid.New().String()
+	oidx := state.NextOutputIndex()
+
+	msgAddEvent := converter.BuildStreamItemAddedEvent(msgID, "assistant", oidx)
+	fmt.Fprint(c.Writer, msgAddEvent)
+
+	deltaEvent := converter.BuildStreamTextDeltaEvent(msgID, text, oidx, 0)
+	fmt.Fprint(c.Writer, deltaEvent)
+
+	doneEvent := converter.BuildStreamTextDoneEvent(msgID, text, oidx, 0)
+	fmt.Fprint(c.Writer, doneEvent)
+
+	contentArr := []map[string]interface{}{
+		{"type": "output_text", "text": text, "annotations": []interface{}{}},
+	}
+	msgItem := map[string]interface{}{
+		"id":      msgID,
+		"type":    "message",
+		"role":    "assistant",
+		"content": contentArr,
+	}
+
+	msgDoneEvent := converter.BuildStreamOutputItemDoneEvent(msgID, oidx, msgItem)
+	fmt.Fprint(c.Writer, msgDoneEvent)
+
+	return []map[string]interface{}{msgItem}
+}
+
+func extractWebSearchToolCall(rawBody []byte) (toolCallID, query string) {
+	var chatResp struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				ToolCalls json.RawMessage `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rawBody, &chatResp); err != nil {
+		return "", ""
+	}
+	if len(chatResp.Choices) == 0 {
+		return "", ""
+	}
+
+	var toolCalls []struct {
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(chatResp.Choices[0].Message.ToolCalls, &toolCalls); err != nil {
+		return "", ""
+	}
+	for _, tc := range toolCalls {
+		if converter.IsBuiltinTool(tc.Function.Name) {
+			var args struct {
+				Query string `json:"query"`
+			}
+			json.Unmarshal([]byte(tc.Function.Arguments), &args)
+			return tc.ID, args.Query
+		}
+	}
+	return "", ""
+}
+
+func extractContentFromResponse(rawBody []byte) string {
+	var chatResp struct {
+		Choices []struct {
+			Message struct {
+				Content *string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rawBody, &chatResp); err != nil {
+		return ""
+	}
+	if len(chatResp.Choices) > 0 && chatResp.Choices[0].Message.Content != nil {
+		return *chatResp.Choices[0].Message.Content
+	}
+	return ""
+}
+
+func buildSearchResponse(originalRespBody []byte, msgText string) []byte {
+	var chatResp struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				ToolCalls json.RawMessage `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage,omitempty"`
+	}
+	json.Unmarshal(originalRespBody, &chatResp)
+
+	var output []map[string]interface{}
+
+	if len(chatResp.Choices) > 0 && chatResp.Choices[0].Message.ToolCalls != nil {
+		var toolCalls []struct {
+			ID       string `json:"id"`
+			Function struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function"`
+		}
+		json.Unmarshal(chatResp.Choices[0].Message.ToolCalls, &toolCalls)
+		for _, tc := range toolCalls {
+			if converter.IsBuiltinTool(tc.Function.Name) {
+				var args struct {
+					Query string `json:"query"`
+				}
+				json.Unmarshal([]byte(tc.Function.Arguments), &args)
+				action := map[string]interface{}{
+					"type": "search",
+				}
+				if args.Query != "" {
+					action["query"] = args.Query
+					action["queries"] = []string{args.Query}
+				}
+				output = append(output, map[string]interface{}{
+					"id":     "ws_" + uuid.New().String(),
+					"type":   tc.Function.Name + "_call",
+					"status": "completed",
+					"action": action,
+				})
+			}
+		}
+	}
+
+	output = append(output, map[string]interface{}{
+		"id":   "msg_" + uuid.New().String(),
+		"type": "message",
+		"role": "assistant",
+		"content": []map[string]interface{}{
+			{"type": "output_text", "text": msgText, "annotations": []interface{}{}},
+		},
+	})
+
+	inputTokens := 0
+	outputTokens := 0
+	if chatResp.Usage != nil {
+		inputTokens = chatResp.Usage.PromptTokens
+		outputTokens = chatResp.Usage.CompletionTokens
+	}
+
+	resp := map[string]interface{}{
+		"id":         "resp_" + uuid.New().String(),
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"model":      chatResp.Model,
+		"status":     "completed",
+		"output":     output,
+		"usage": map[string]interface{}{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+			"total_tokens":  inputTokens + outputTokens,
+		},
+	}
+	b, _ := json.Marshal(resp)
+	return b
 }
