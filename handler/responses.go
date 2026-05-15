@@ -91,6 +91,11 @@ func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Re
 		return
 	}
 
+	l.Info("upstream model response",
+		"status", http.StatusOK,
+		"body", string(rawBody),
+	)
+
 	converted, err := converter.ConvertNonStreamingResponse(rawBody)
 	if err != nil {
 		l.Error("convert response failed", "error", err.Error())
@@ -130,6 +135,16 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 	for scanner.Scan() {
 		line := scanner.Text()
 		deltaText, finishReason, isDone, upstreamUsage, toolCallDeltas := converter.ParseChatStreamLine(line)
+
+		// 记录上游返回的每个非空 chunk
+		if deltaText != "" || len(toolCallDeltas) > 0 || finishReason != "" || upstreamUsage != nil {
+			l.Info("upstream stream chunk",
+				"delta_text", deltaText,
+				"tool_call_count", len(toolCallDeltas),
+				"finish_reason", finishReason,
+				"usage", upstreamUsage,
+			)
+		}
 
 		if isDone {
 			break
@@ -274,6 +289,11 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 				fmt.Fprint(c.Writer, itemDoneEvent)
 			}
 
+			l.Info("sending response.completed",
+				"output", output,
+				"usage", fmt.Sprintf(`{"input_tokens":%d,"output_tokens":%d}`, state.PromptTokens, state.CompletionTokens),
+			)
+
 			completedEvent := converter.BuildStreamCompletedEvent(
 				state.RespID, state.Model, state.CreatedAt,
 				status, output,
@@ -293,6 +313,10 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 		"status", http.StatusOK,
 		"duration", time.Since(start).String(),
 		"type", "stream",
+		"model", state.Model,
+		"text_length", len(state.AccumulatedText),
+		"has_text", state.HasContent,
+		"tool_call_count", len(state.ToolCalls),
 		"usage", fmt.Sprintf(`{"input_tokens":%d,"output_tokens":%d}`, state.PromptTokens, state.CompletionTokens),
 	)
 }
