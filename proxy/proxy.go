@@ -67,10 +67,28 @@ func (p *Proxy) Send(ctx context.Context, path string, body []byte, authHeader s
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}
 
-	l.Info("upstream response",
-		"status", resp.StatusCode,
-		"duration", time.Since(start).String(),
-	)
+	contentType := resp.Header.Get("Content-Type")
+	isStream := strings.Contains(contentType, "text/event-stream")
+
+	if isStream {
+		l.Info("upstream response",
+			"status", resp.StatusCode,
+			"duration", time.Since(start).String(),
+			"stream", true,
+		)
+	} else {
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read upstream response body: %w", readErr)
+		}
+		l.Info("upstream response",
+			"status", resp.StatusCode,
+			"duration", time.Since(start).String(),
+			"body", string(respBody),
+		)
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+	}
 
 	return resp, nil
 }

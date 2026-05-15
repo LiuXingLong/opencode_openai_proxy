@@ -91,11 +91,6 @@ func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Re
 		return
 	}
 
-	l.Info("upstream model response",
-		"status", http.StatusOK,
-		"body", string(rawBody),
-	)
-
 	converted, err := converter.ConvertNonStreamingResponse(rawBody)
 	if err != nil {
 		l.Error("convert response failed", "error", err.Error())
@@ -138,7 +133,7 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 
 		// 记录上游返回的每个非空 chunk
 		if deltaText != "" || len(toolCallDeltas) > 0 || finishReason != "" || upstreamUsage != nil {
-			l.Info("upstream stream chunk",
+			l.Debug("upstream stream chunk",
 				"delta_text", deltaText,
 				"tool_call_count", len(toolCallDeltas),
 				"finish_reason", finishReason,

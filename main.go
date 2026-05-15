@@ -21,7 +21,7 @@ func main() {
 
 	cfg := config.Load()
 
-	l, err := logger.Init(cfg.LogFile)
+	l, err := logger.Init(cfg.LogFile, cfg.LogLevel)
 	if err != nil {
 		log.Fatalf("init logger failed: %v", err)
 	}

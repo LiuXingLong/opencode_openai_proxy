@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -73,15 +74,29 @@ func (w *ReopenWriter) Close() error {
 
 var globalRW *ReopenWriter
 
-func Init(logFile string) (*slog.Logger, error) {
+func Init(logFile string, logLevel string) (*slog.Logger, error) {
 	rw, err := NewReopenWriter(logFile)
 	if err != nil {
 		return nil, err
 	}
 	globalRW = rw
 
+	var level slog.Level
+	switch strings.ToLower(logLevel) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
 	mw := io.MultiWriter(os.Stderr, rw)
-	l := slog.New(slog.NewJSONHandler(mw, nil))
+	l := slog.New(slog.NewJSONHandler(mw, &slog.HandlerOptions{
+		Level: level,
+	}))
 	return l, nil
 }
 

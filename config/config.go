@@ -9,6 +9,7 @@ type Config struct {
 	UpstreamBaseURL string
 	ListenAddr      string
 	LogFile         string
+	LogLevel        string
 	RouteMap        map[string]string
 }
 
@@ -19,6 +20,7 @@ func Load() *Config {
 		UpstreamBaseURL: getEnv("UPSTREAM_BASE_URL", "https://opencode.ai/zen"),
 		ListenAddr:      getEnv("LISTEN_ADDR", ":8082"),
 		LogFile:         getEnv("LOG_FILE", "./logs/proxy.log"),
+		LogLevel:        getEnv("LOG_LEVEL", "info"),
 		RouteMap:        routeMap,
 	}
 }
