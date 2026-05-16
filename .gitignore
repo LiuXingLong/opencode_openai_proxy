@@ -1,3 +1,8 @@
 logs
 opencode-openai-proxy
 .env
+.vscode
+.idea
+.DS_Store
+node_modules
+dist
