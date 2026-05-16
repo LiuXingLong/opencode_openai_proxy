@@ -50,7 +50,10 @@ OpenAI Responses API 代理 — 将 `/v1/responses` 请求转换为 `/v1/chat/co
 ### Docker
 
 ```bash
-# 构建并启动
+# 1. 本地编译 Linux 二进制
+./manage.sh build
+
+# 2. 构建镜像并启动
 docker compose up -d
 
 # 查看日志
@@ -58,10 +61,9 @@ docker compose logs -f
 
 # 停止
 docker compose down
-
-# 使用自定义环境变量
-UPSTREAM_BASE_URL=https://your-upstream.com/zen docker compose up -d
 ```
+
+> **注意**：Docker 镜像采用"本地编译、容器运行"模式，构建镜像前需要先执行 `./manage.sh build` 编译 Linux ARM64 二进制文件 `opencode-openai-proxy-docker`。
 
 ## 配置
 
@@ -77,6 +79,8 @@ UPSTREAM_BASE_URL=https://your-upstream.com/zen docker compose up -d
 | `SEARXNG_BASE_URL` | `http://localhost:8086` | SearXNG 服务地址（仅 `SEARCH_BACKEND=searxng` 时使用） |
 | `SEARXNG_SUMMARIZE` | `false` | 是否将 SearXNG 搜索结果发给模型总结（`true` 时类似 Bing 行为，结果经模型分析后返回） |
 | `BLOCK_WEB_SEARCH` | `true` | 是否屏蔽 `web_search` 工具（设为 `true` 时不传 `web_search` 给上游模型，让 Codex CLI 自行处理搜索） |
+
+> Docker 部署时参考 `[.env.docker.example](.env.docker.example)` 文件，其中默认使用 `host.docker.internal` 访问宿主机服务。镜像构建时会自动将此文件复制为容器内的 `/app/.env`。
 
 ### 路径路由
 
@@ -280,8 +284,9 @@ curl -N -X POST http://localhost:8082/v1/responses \
 opencode_openai_proxy/
 ├── main.go              # 入口
 ├── manage.sh            # 管理脚本（build/start/stop/restart/reopen）
-├── Dockerfile           # Docker 镜像构建
-├── docker-compose.yml   # Docker Compose 编排
+├── Dockerfile           # Docker 镜像构建（单阶段，拷贝预编译二进制）
+├── docker-compose.yml   # Docker Compose 编排（含 healthcheck、环境变量透传）
+├── .dockerignore        # Docker 构建排除规则
 ├── config/config.go     # 配置（支持 .env）
 ├── logger/logger.go     # 日志（slog JSON + 文件，自动重建）
 ├── middleware/
