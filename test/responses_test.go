@@ -87,7 +87,7 @@ func TestPathRoutingDefaultUpstream(t *testing.T) {
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
 	s := searcher.New(0, 0, "", 0, "", "")
-	h := handler.NewResponsesHandler(p, s, 3, false)
+	h := handler.NewResponsesHandler(p, s, 3, false, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -136,7 +136,7 @@ func TestPathRoutingOllamaUpstream(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3, false)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3, false, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -185,7 +185,7 @@ func TestPathRoutingOllamaUpstreamWrongPath(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3, false)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3, false, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -222,7 +222,7 @@ func TestPathRoutingNotFound(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3, false)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3, false, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -302,7 +302,7 @@ func TestSearXNGNonStreaming(t *testing.T) {
 
 	p := proxy.New(upstreamSrv.URL, nil)
 	s := searcher.New(0, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
-	h := handler.NewResponsesHandler(p, s, 3, false)
+	h := handler.NewResponsesHandler(p, s, 3, false, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -379,7 +379,7 @@ func TestSearXNGStreaming(t *testing.T) {
 
 	p := proxy.New(upstreamSrv.URL, nil)
 	s := searcher.New(0, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
-	h := handler.NewResponsesHandler(p, s, 3, false)
+	h := handler.NewResponsesHandler(p, s, 3, false, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -476,7 +476,7 @@ func TestSearXNGNonStreamingWithSummarize(t *testing.T) {
 
 	p := proxy.New(upstreamSrv.URL, nil)
 	s := searcher.New(10, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
-	h := handler.NewResponsesHandler(p, s, 3, true)
+	h := handler.NewResponsesHandler(p, s, 3, true, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -543,7 +543,7 @@ func TestSearXNGStreamingWithSummarize(t *testing.T) {
 
 	p := proxy.New(upstreamSrv.URL, nil)
 	s := searcher.New(10, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
-	h := handler.NewResponsesHandler(p, s, 3, true)
+	h := handler.NewResponsesHandler(p, s, 3, true, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())

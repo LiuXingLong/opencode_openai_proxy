@@ -12,6 +12,7 @@ OpenAI Responses API 代理 — 将 `/v1/responses` 请求转换为 `/v1/chat/co
 - **工具调用**：支持 `tools` 参数和 `function_call_output` 输入转换
 - **内置工具映射**：`web_search` 等内置工具自动映射为 function 格式
 - **搜索后端**：支持 Bing 和 SearXNG 两种搜索后端，通过环境变量切换
+- **web_search 屏蔽**：默认屏蔽 `web_search` 工具，让 Codex CLI 自行通过 bash/curl 搜索
 
 ## 架构
 
@@ -72,9 +73,10 @@ UPSTREAM_BASE_URL=https://your-upstream.com/zen docker compose up -d
 | `UPSTREAM_ROUTES` | - | 按路径前缀分发的路由表，JSON 格式。最长前缀匹配，未匹配时回退到 `UPSTREAM_BASE_URL` |
 | `LISTEN_ADDR` | `:8082` | 代理监听地址 |
 | `LOG_FILE` | `./logs/proxy.log` | 日志文件路径 |
-| `SEARCH_BACKEND` | `bing` | 搜索后端：`bing` 或 `searxng` |
+| `SEARCH_BACKEND` | `searxng` | 搜索后端：`bing` 或 `searxng` |
 | `SEARXNG_BASE_URL` | `http://localhost:8086` | SearXNG 服务地址（仅 `SEARCH_BACKEND=searxng` 时使用） |
 | `SEARXNG_SUMMARIZE` | `false` | 是否将 SearXNG 搜索结果发给模型总结（`true` 时类似 Bing 行为，结果经模型分析后返回） |
+| `BLOCK_WEB_SEARCH` | `true` | 是否屏蔽 `web_search` 工具（设为 `true` 时不传 `web_search` 给上游模型，让 Codex CLI 自行处理搜索） |
 
 ### 路径路由
 
@@ -97,20 +99,23 @@ curl -X POST http://localhost:8082/ollama/v1/responses \
   -d '{"model":"gpt-oss:20b","input":"你好","stream":false}'
 ```
 
-### 搜索后端
+### `web_search` 与搜索后端
 
-`SEARCH_BACKEND=searxng` 时，`web_search` 工具调用将使用 SearXNG 搜索。搜索结果的后续处理由 `SEARXNG_SUMMARIZE` 控制：
-- `SEARXNG_SUMMARIZE=false`（默认）：搜索结果直接格式化后返回给客户端（跳过模型重请求）
-- `SEARXNG_SUMMARIZE=true`：搜索结果发送给模型进行总结分析，模型回答作为最终结果返回
+默认配置下（`BLOCK_WEB_SEARCH=true`），代理会屏蔽 `web_search` 工具，不传递给上游模型。Codex CLI 通过自身的 bash/curl 机制处理搜索。
 
-`SEARCH_BACKEND=bing`（默认）时，结果始终重新请求模型生成答案。
+设置 `BLOCK_WEB_SEARCH=false` 启用代理端搜索。此时 `SEARCH_BACKEND` 决定使用哪个后端：
+
+- `SEARCH_BACKEND=searxng`（默认）：`web_search` 调用使用 SearXNG 搜索。结果处理由 `SEARXNG_SUMMARIZE` 控制：
+  - `SEARXNG_SUMMARIZE=false`（默认）：直接格式化后返回
+  - `SEARXNG_SUMMARIZE=true`：结果发给模型总结后再返回
+- `SEARCH_BACKEND=bing`：结果始终重新请求模型生成答案
 
 ```bash
-# 使用 SearXNG 后端
-SEARCH_BACKEND=searxng ./opencode-openai-proxy
+# 启用代理端搜索（使用默认 SearXNG 后端）
+BLOCK_WEB_SEARCH=false ./opencode-openai-proxy
 
-# 使用 Bing 后端（默认）
-SEARCH_BACKEND=bing ./opencode-openai-proxy
+# 使用 Bing 后端
+BLOCK_WEB_SEARCH=false SEARCH_BACKEND=bing ./opencode-openai-proxy
 ```
 
 ## API 使用

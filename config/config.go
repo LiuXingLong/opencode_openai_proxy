@@ -20,6 +20,7 @@ type Config struct {
 	SearchBackend     string
 	SearXNGBaseURL    string
 	SearXNGSummarize  bool
+	BlockWebSearch    bool
 }
 
 func Load() *Config {
@@ -38,9 +39,10 @@ func Load() *Config {
 		SearchBingURL:     getEnv("BING_SEARCH_URL", "https://www.bing.com/search?q="),
 		SearchConcurrency: getEnvInt("BING_SEARCH_CONCURRENCY", defaultResultCount),
 		SearchRetryCount:  getEnvInt("SEARCH_RETRY_COUNT", 3),
-		SearchBackend:     getEnv("SEARCH_BACKEND", "bing"),
+		SearchBackend:     getEnv("SEARCH_BACKEND", "searxng"),
 		SearXNGBaseURL:    getEnv("SEARXNG_BASE_URL", "http://localhost:8086"),
 		SearXNGSummarize:  getEnv("SEARXNG_SUMMARIZE", "") == "true",
+		BlockWebSearch:    getEnv("BLOCK_WEB_SEARCH", "true") == "true",
 	}
 }
 

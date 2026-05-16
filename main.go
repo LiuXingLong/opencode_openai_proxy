@@ -38,7 +38,7 @@ func main() {
 
 	p := proxy.New(cfg.UpstreamBaseURL, cfg.RouteMap)
 	s := searcher.New(cfg.SearchResultCount, time.Duration(cfg.SearchTimeout)*time.Second, cfg.SearchBingURL, cfg.SearchConcurrency, cfg.SearchBackend, cfg.SearXNGBaseURL)
-	h := handler.NewResponsesHandler(p, s, cfg.SearchRetryCount, cfg.SearXNGSummarize)
+	h := handler.NewResponsesHandler(p, s, cfg.SearchRetryCount, cfg.SearXNGSummarize, cfg.BlockWebSearch)
 
 	// 注册路由表中的路径 + 默认 /v1/responses
 	registered := map[string]bool{"/v1/responses": true}

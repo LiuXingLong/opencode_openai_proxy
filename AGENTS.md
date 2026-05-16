@@ -31,9 +31,10 @@ GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go mod 
 - `UPSTREAM_ROUTES` — 按路径前缀分发的路由表，JSON 格式，如 `{"/v1/responses":"https://upstream-a.com","/v1":"https://upstream-b.com"}`。最长前缀匹配，未匹配时回退到 `UPSTREAM_BASE_URL`
 - `LISTEN_ADDR` — 监听地址，默认 `:8082`
 - `LOG_FILE` — 日志文件路径，默认 `./logs/proxy.log`
-- `SEARCH_BACKEND` — 搜索后端：`bing` 或 `searxng`，默认 `bing`
+- `SEARCH_BACKEND` — 搜索后端：`bing` 或 `searxng`，默认 `searxng`
 - `SEARXNG_BASE_URL` — SearXNG 地址（仅 `SEARCH_BACKEND=searxng` 时使用），默认 `http://localhost:8086`
 - `SEARXNG_SUMMARIZE` — 是否将 SearXNG 搜索结果发给模型总结，默认 `false`
+- `BLOCK_WEB_SEARCH` — 是否屏蔽 `web_search` 工具（设为 `true` 时不传 `web_search` 给上游模型，让 Codex CLI 自行处理搜索），默认 `true`
 
 ## 项目结构
 

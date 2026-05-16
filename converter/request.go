@@ -58,7 +58,7 @@ type contentPart struct {
 	Text string `json:"text,omitempty"`
 }
 
-func ConvertRequest(raw []byte) ([]byte, error) {
+func ConvertRequest(raw []byte, blockWebSearch bool) ([]byte, error) {
 	var req responsesRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, fmt.Errorf("unmarshal responses request: %w", err)
@@ -72,7 +72,7 @@ func ConvertRequest(raw []byte) ([]byte, error) {
 		Stop:             req.Stop,
 		FrequencyPenalty: req.FrequencyPenalty,
 		PresencePenalty:  req.PresencePenalty,
-		Tools:            convertTools(req.Tools),
+		Tools:            convertTools(req.Tools, blockWebSearch),
 		ToolChoice:       req.ToolChoice,
 		Stream:           req.Stream,
 		StreamOptions:    req.StreamOptions,
@@ -220,7 +220,7 @@ var builtinToolMapping = map[string]map[string]interface{}{
 	},
 }
 
-func convertTools(raw json.RawMessage) json.RawMessage {
+func convertTools(raw json.RawMessage, blockWebSearch bool) json.RawMessage {
 	if len(raw) == 0 || raw[0] != '[' {
 		return raw
 	}
@@ -238,6 +238,11 @@ func convertTools(raw json.RawMessage) json.RawMessage {
 		}
 
 		toolType, _ := toolMap["type"].(string)
+
+		if blockWebSearch && toolType == "web_search" {
+			continue
+		}
+
 		switch toolType {
 		case "function":
 			funcDef := make(map[string]interface{})

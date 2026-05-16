@@ -25,10 +25,11 @@ type ResponsesHandler struct {
 	Searcher         *searcher.Searcher
 	retryCount       int
 	searxngSummarize bool
+	blockWebSearch   bool
 }
 
-func NewResponsesHandler(p *proxy.Proxy, s *searcher.Searcher, retryCount int, searxngSummarize bool) *ResponsesHandler {
-	return &ResponsesHandler{Proxy: p, Searcher: s, retryCount: retryCount, searxngSummarize: searxngSummarize}
+func NewResponsesHandler(p *proxy.Proxy, s *searcher.Searcher, retryCount int, searxngSummarize bool, blockWebSearch bool) *ResponsesHandler {
+	return &ResponsesHandler{Proxy: p, Searcher: s, retryCount: retryCount, searxngSummarize: searxngSummarize, blockWebSearch: blockWebSearch}
 }
 
 func (h *ResponsesHandler) Create(c *gin.Context) {
@@ -56,7 +57,7 @@ func (h *ResponsesHandler) Create(c *gin.Context) {
 		"body", string(body),
 	)
 
-	chatReqBody, err := converter.ConvertRequest(body)
+	chatReqBody, err := converter.ConvertRequest(body, h.blockWebSearch)
 	if err != nil {
 		l.Error("convert request failed", "error", err.Error())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "conversion failed"})
@@ -99,7 +100,7 @@ func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Re
 	}
 
 	toolCallID, query := extractWebSearchToolCall(rawBody)
-	if toolCallID != "" {
+	if toolCallID != "" && !h.blockWebSearch {
 		if h.Searcher.Backend() == "searxng" {
 			h.handleSearXNGNonStreaming(c, rawBody, query, toolCallID, start, l, originalBody, authHeader)
 			return
@@ -240,6 +241,9 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 					name = tcd.Type
 				}
 				isBuiltin := converter.IsBuiltinTool(name)
+				if h.blockWebSearch && isBuiltin {
+					isBuiltin = false
+				}
 				fcIsBuiltin[tcd.Index] = isBuiltin
 				if isBuiltin {
 					var itemID string
