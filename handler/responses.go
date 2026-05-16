@@ -21,13 +21,14 @@ import (
 )
 
 type ResponsesHandler struct {
-	Proxy      *proxy.Proxy
-	Searcher   *searcher.Searcher
-	retryCount int
+	Proxy            *proxy.Proxy
+	Searcher         *searcher.Searcher
+	retryCount       int
+	searxngSummarize bool
 }
 
-func NewResponsesHandler(p *proxy.Proxy, s *searcher.Searcher, retryCount int) *ResponsesHandler {
-	return &ResponsesHandler{Proxy: p, Searcher: s, retryCount: retryCount}
+func NewResponsesHandler(p *proxy.Proxy, s *searcher.Searcher, retryCount int, searxngSummarize bool) *ResponsesHandler {
+	return &ResponsesHandler{Proxy: p, Searcher: s, retryCount: retryCount, searxngSummarize: searxngSummarize}
 }
 
 func (h *ResponsesHandler) Create(c *gin.Context) {
@@ -100,7 +101,7 @@ func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Re
 	toolCallID, query := extractWebSearchToolCall(rawBody)
 	if toolCallID != "" {
 		if h.Searcher.Backend() == "searxng" {
-			h.handleSearXNGNonStreaming(c, rawBody, query, toolCallID, start, l)
+			h.handleSearXNGNonStreaming(c, rawBody, query, toolCallID, start, l, originalBody, authHeader)
 			return
 		}
 
@@ -422,7 +423,7 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 
 				if searchQuery != "" {
 					if h.Searcher.Backend() == "searxng" {
-						h.handleSearXNGStreamingSearch(c, state, searchQuery, searchCallID, &output, l)
+						h.handleSearXNGStreamingSearch(c, state, searchQuery, searchCallID, &output, l, originalBody, authHeader)
 					} else {
 						var accumulatedText string
 						totalAttempts := h.retryCount + 1
@@ -748,9 +749,31 @@ func buildSearchResponse(originalRespBody []byte, msgText string) []byte {
 	return b
 }
 
-func (h *ResponsesHandler) handleSearXNGNonStreaming(c *gin.Context, rawBody []byte, query, callID string, start time.Time, l *slog.Logger) {
+func (h *ResponsesHandler) handleSearXNGNonStreaming(c *gin.Context, rawBody []byte, query, callID string, start time.Time, l *slog.Logger, originalBody []byte, authHeader string) {
 	results := h.Searcher.Search(c.Request.Context(), query)
 	resultsText := formatSearchResults(results)
+
+	if h.searxngSummarize && len(results) > 0 {
+		resultsJSON, _ := json.Marshal(results)
+		reInvokeBody, err := converter.BuildReInvokeRequest(originalBody, query, resultsJSON, callID)
+		if err == nil {
+			var m map[string]interface{}
+			json.Unmarshal(reInvokeBody, &m)
+			m["stream"] = false
+			reInvokeBody, _ = json.Marshal(m)
+
+			reInvokeResp, err := h.Proxy.Send(c.Request.Context(), c.Request.URL.Path, reInvokeBody, authHeader)
+			if err == nil && reInvokeResp.StatusCode == http.StatusOK {
+				reInvokeRaw, _ := io.ReadAll(reInvokeResp.Body)
+				reInvokeResp.Body.Close()
+				if modelText := extractContentFromResponse(reInvokeRaw); modelText != "" {
+					l.Info("search: searxng summarize result", "query", query, "summary", modelText)
+					resultsText = modelText
+				}
+			}
+		}
+	}
+
 	if len(results) > 0 {
 		resultsJSON, _ := json.Marshal(map[string]interface{}{
 			"query":       query,
@@ -776,9 +799,31 @@ func (h *ResponsesHandler) handleSearXNGNonStreaming(c *gin.Context, rawBody []b
 	c.Data(http.StatusOK, "application/json", converted)
 }
 
-func (h *ResponsesHandler) handleSearXNGStreamingSearch(c *gin.Context, state *converter.StreamState, searchQuery, searchCallID string, output *[]map[string]interface{}, l *slog.Logger) {
+func (h *ResponsesHandler) handleSearXNGStreamingSearch(c *gin.Context, state *converter.StreamState, searchQuery, searchCallID string, output *[]map[string]interface{}, l *slog.Logger, originalBody []byte, authHeader string) {
 	results := h.Searcher.Search(c.Request.Context(), searchQuery)
 	resultsText := formatSearchResults(results)
+
+	if h.searxngSummarize && len(results) > 0 {
+		resultsJSON, _ := json.Marshal(results)
+		reInvokeBody, err := converter.BuildReInvokeRequest(originalBody, searchQuery, resultsJSON, searchCallID)
+		if err == nil {
+			var m map[string]interface{}
+			json.Unmarshal(reInvokeBody, &m)
+			m["stream"] = false
+			reInvokeBody, _ = json.Marshal(m)
+
+			reInvokeResp, err := h.Proxy.Send(c.Request.Context(), c.Request.URL.Path, reInvokeBody, authHeader)
+			if err == nil && reInvokeResp.StatusCode == http.StatusOK {
+				reInvokeRaw, _ := io.ReadAll(reInvokeResp.Body)
+				reInvokeResp.Body.Close()
+				if modelText := extractContentFromResponse(reInvokeRaw); modelText != "" {
+					l.Info("search: searxng summarize result", "query", searchQuery, "summary", modelText)
+					resultsText = modelText
+				}
+			}
+		}
+	}
+
 	if len(results) > 0 {
 		resultsJSON, _ := json.Marshal(map[string]interface{}{
 			"query":       searchQuery,

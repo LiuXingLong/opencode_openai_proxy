@@ -31,6 +31,9 @@ GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go mod 
 - `UPSTREAM_ROUTES` — 按路径前缀分发的路由表，JSON 格式，如 `{"/v1/responses":"https://upstream-a.com","/v1":"https://upstream-b.com"}`。最长前缀匹配，未匹配时回退到 `UPSTREAM_BASE_URL`
 - `LISTEN_ADDR` — 监听地址，默认 `:8082`
 - `LOG_FILE` — 日志文件路径，默认 `./logs/proxy.log`
+- `SEARCH_BACKEND` — 搜索后端：`bing` 或 `searxng`，默认 `bing`
+- `SEARXNG_BASE_URL` — SearXNG 地址（仅 `SEARCH_BACKEND=searxng` 时使用），默认 `http://localhost:8086`
+- `SEARXNG_SUMMARIZE` — 是否将 SearXNG 搜索结果发给模型总结，默认 `false`
 
 ## 项目结构
 
@@ -49,9 +52,16 @@ GOROOT=/Users/xinglongliu/go/go1.25.8 /Users/xinglongliu/go/go1.25.8/bin/go mod 
 │   └── trace.go            # 追踪（trace_id 注入到 context 和响应头）
 ├── proxy/proxy.go          # 上游 HTTP 客户端（含路径路由选择）
 ├── logger/logger.go        # JSON 日志（文件+stderr 双写，支持 SIGHUP 重开）
+├── searcher/               # 搜索后端
+│   ├── searcher.go         # 搜索接口（支持后端切换）
+│   ├── bing.go             # Bing 搜索实现
+│   ├── searxng.go          # SearXNG 搜索实现
+│   ├── fetcher.go          # 页面抓取
+│   ├── search_test.go      # 搜索测试
+│   └── searxng_test.go     # SearXNG 搜索测试
 ├── test/                   # 集成测试
 │   ├── auth_test.go        # 认证中间件测试
-│   └── responses_test.go   # 路径路由测试
+│   └── responses_test.go   # 路径路由+SearXNG 集成测试
 ├── manage.sh               # 管理脚本
 ├── .env                    # 环境变量配置（gitignored）
 └── logs/proxy.log          # 日志文件（gitignored）

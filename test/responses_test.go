@@ -87,7 +87,7 @@ func TestPathRoutingDefaultUpstream(t *testing.T) {
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
 	s := searcher.New(0, 0, "", 0, "", "")
-	h := handler.NewResponsesHandler(p, s, 3)
+	h := handler.NewResponsesHandler(p, s, 3, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -136,7 +136,7 @@ func TestPathRoutingOllamaUpstream(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -185,7 +185,7 @@ func TestPathRoutingOllamaUpstreamWrongPath(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -222,7 +222,7 @@ func TestPathRoutingNotFound(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -302,7 +302,7 @@ func TestSearXNGNonStreaming(t *testing.T) {
 
 	p := proxy.New(upstreamSrv.URL, nil)
 	s := searcher.New(0, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
-	h := handler.NewResponsesHandler(p, s, 3)
+	h := handler.NewResponsesHandler(p, s, 3, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -379,7 +379,7 @@ func TestSearXNGStreaming(t *testing.T) {
 
 	p := proxy.New(upstreamSrv.URL, nil)
 	s := searcher.New(0, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
-	h := handler.NewResponsesHandler(p, s, 3)
+	h := handler.NewResponsesHandler(p, s, 3, false)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -447,5 +447,158 @@ func TestSearXNGStreaming(t *testing.T) {
 	expectedText := "1. R1\nhttps://e.com/1\ncontent 1"
 	if text != expectedText {
 		t.Errorf("expected text %q, got %q", expectedText, text)
+	}
+}
+
+func TestSearXNGNonStreamingWithSummarize(t *testing.T) {
+	searxngSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"results": []map[string]interface{}{
+				{"title": "Result 1", "url": "https://e.com/1", "content": "content one"},
+				{"title": "Result 2", "url": "https://e.com/2", "content": "content two"},
+			},
+		})
+	}))
+	defer searxngSrv.Close()
+
+	reInvokeCalled := false
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !reInvokeCalled {
+			reInvokeCalled = true
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, toolCallResponse("call_reinvoke", "web_search", `{"query":"test query"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, chatResponse("chatcmpl-summary", "这是模型根据搜索结果生成的总结"))
+	}))
+	defer upstreamSrv.Close()
+
+	p := proxy.New(upstreamSrv.URL, nil)
+	s := searcher.New(10, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
+	h := handler.NewResponsesHandler(p, s, 3, true)
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(middleware.Trace())
+	r.Use(middleware.Auth())
+	r.POST("/v1/responses", h.Create)
+
+	body := `{"model":"test-model","input":"test query","stream":false}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/responses", bytes.NewReader([]byte(body)))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	output, _ := resp["output"].([]interface{})
+	if len(output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(output))
+	}
+	msgItem, _ := output[1].(map[string]interface{})
+	content, _ := msgItem["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("expected 1 content item, got %d", len(content))
+	}
+	part, _ := content[0].(map[string]interface{})
+	text, _ := part["text"].(string)
+	expected := "这是模型根据搜索结果生成的总结"
+	if text != expected {
+		t.Errorf("expected summary %q, got %q", expected, text)
+	}
+}
+
+func TestSearXNGStreamingWithSummarize(t *testing.T) {
+	searxngSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"results": []map[string]interface{}{
+				{"title": "Result 1", "url": "https://e.com/1", "content": "content one"},
+			},
+		})
+	}))
+	defer searxngSrv.Close()
+
+	reInvokeCount := 0
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if reInvokeCount == 0 {
+			reInvokeCount++
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_testcallid","type":"function","function":{"name":"web_search","arguments":""}}]}}]}`)
+			fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\": \"test query\"}"}}]}}]}`)
+			fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, chatResponse("chatcmpl-summary", "流式模型总结结果"))
+	}))
+	defer upstreamSrv.Close()
+
+	p := proxy.New(upstreamSrv.URL, nil)
+	s := searcher.New(10, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
+	h := handler.NewResponsesHandler(p, s, 3, true)
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(middleware.Trace())
+	r.Use(middleware.Auth())
+	r.POST("/v1/responses", h.Create)
+
+	body := `{"model":"test-model","input":"test query","stream":true}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/responses", bytes.NewReader([]byte(body)))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var completedResponse map[string]interface{}
+	scanner := bufio.NewScanner(bytes.NewReader(w.Body.Bytes()))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		dataStr := strings.TrimPrefix(line, "data: ")
+		var event struct {
+			Type     string                 `json:"type"`
+			Response map[string]interface{} `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(dataStr), &event); err != nil {
+			continue
+		}
+		if event.Type == "response.completed" {
+			completedResponse = event.Response
+		}
+	}
+
+	if completedResponse == nil {
+		t.Fatal("no response.completed event found")
+	}
+
+	output, _ := completedResponse["output"].([]interface{})
+	if len(output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(output))
+	}
+
+	msgItem, _ := output[1].(map[string]interface{})
+	content, _ := msgItem["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("expected 1 content item, got %d", len(content))
+	}
+	part, _ := content[0].(map[string]interface{})
+	text, _ := part["text"].(string)
+	expected := "流式模型总结结果"
+	if text != expected {
+		t.Errorf("expected summary %q, got %q", expected, text)
 	}
 }

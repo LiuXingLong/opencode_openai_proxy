@@ -74,6 +74,7 @@ UPSTREAM_BASE_URL=https://your-upstream.com/zen docker compose up -d
 | `LOG_FILE` | `./logs/proxy.log` | 日志文件路径 |
 | `SEARCH_BACKEND` | `bing` | 搜索后端：`bing` 或 `searxng` |
 | `SEARXNG_BASE_URL` | `http://localhost:8086` | SearXNG 服务地址（仅 `SEARCH_BACKEND=searxng` 时使用） |
+| `SEARXNG_SUMMARIZE` | `false` | 是否将 SearXNG 搜索结果发给模型总结（`true` 时类似 Bing 行为，结果经模型分析后返回） |
 
 ### 路径路由
 
@@ -98,7 +99,11 @@ curl -X POST http://localhost:8082/ollama/v1/responses \
 
 ### 搜索后端
 
-`SEARCH_BACKEND=searxng` 时，`web_search` 工具调用将使用 SearXNG 搜索，结果直接返回给客户端（跳过模型重请求）。`SEARCH_BACKEND=bing`（默认）时，结果会重新请求模型生成答案。
+`SEARCH_BACKEND=searxng` 时，`web_search` 工具调用将使用 SearXNG 搜索。搜索结果的后续处理由 `SEARXNG_SUMMARIZE` 控制：
+- `SEARXNG_SUMMARIZE=false`（默认）：搜索结果直接格式化后返回给客户端（跳过模型重请求）
+- `SEARXNG_SUMMARIZE=true`：搜索结果发送给模型进行总结分析，模型回答作为最终结果返回
+
+`SEARCH_BACKEND=bing`（默认）时，结果始终重新请求模型生成答案。
 
 ```bash
 # 使用 SearXNG 后端

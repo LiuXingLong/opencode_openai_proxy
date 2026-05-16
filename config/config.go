@@ -19,6 +19,7 @@ type Config struct {
 	SearchRetryCount  int
 	SearchBackend     string
 	SearXNGBaseURL    string
+	SearXNGSummarize  bool
 }
 
 func Load() *Config {
@@ -39,6 +40,7 @@ func Load() *Config {
 		SearchRetryCount:  getEnvInt("SEARCH_RETRY_COUNT", 3),
 		SearchBackend:     getEnv("SEARCH_BACKEND", "bing"),
 		SearXNGBaseURL:    getEnv("SEARXNG_BASE_URL", "http://localhost:8086"),
+		SearXNGSummarize:  getEnv("SEARXNG_SUMMARIZE", "") == "true",
 	}
 }
 
