@@ -20,9 +20,11 @@ type Searcher struct {
 	timeout     time.Duration
 	bingURL     string
 	concurrency int
+	backend     string
+	searxngURL  string
 }
 
-func New(resultCount int, timeout time.Duration, bingURL string, concurrency int) *Searcher {
+func New(resultCount int, timeout time.Duration, bingURL string, concurrency int, backend string, searxngURL string) *Searcher {
 	if concurrency <= 0 {
 		concurrency = resultCount
 	}
@@ -33,12 +35,29 @@ func New(resultCount int, timeout time.Duration, bingURL string, concurrency int
 		timeout:     timeout,
 		bingURL:     bingURL,
 		concurrency: concurrency,
+		backend:     backend,
+		searxngURL:  searxngURL,
 	}
+}
+
+func (s *Searcher) Backend() string {
+	return s.backend
 }
 
 func (s *Searcher) Search(ctx context.Context, query string) []SearchResult {
 	searchCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
+
+	if s.backend == "searxng" {
+		results, err := s.searchSearXNG(searchCtx, query)
+		if err != nil || len(results) == 0 {
+			return nil
+		}
+		if s.resultCount > 0 && len(results) > s.resultCount {
+			results = results[:s.resultCount]
+		}
+		return results
+	}
 
 	results, err := s.searchBing(searchCtx, query)
 	if err != nil || len(results) == 0 {

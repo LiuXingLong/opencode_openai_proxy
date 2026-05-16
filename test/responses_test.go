@@ -1,12 +1,15 @@
 package test
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -83,7 +86,7 @@ func TestPathRoutingDefaultUpstream(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	s := searcher.New(0, 0, "", 0)
+	s := searcher.New(0, 0, "", 0, "", "")
 	h := handler.NewResponsesHandler(p, s, 3)
 
 	r := gin.New()
@@ -133,7 +136,7 @@ func TestPathRoutingOllamaUpstream(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0), 3)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -182,7 +185,7 @@ func TestPathRoutingOllamaUpstreamWrongPath(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0), 3)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -219,7 +222,7 @@ func TestPathRoutingNotFound(t *testing.T) {
 	}
 
 	p := proxy.New(defaultUpstream.URL, routeMap)
-	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0), 3)
+	h := handler.NewResponsesHandler(p, searcher.New(0, 0, "", 0, "", ""), 3)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -241,5 +244,208 @@ func TestPathRoutingNotFound(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("unregistered path: expected 404, got %d", w.Code)
+	}
+}
+
+func toolCallResponse(callID, name, args string) string {
+	b, _ := json.Marshal(map[string]interface{}{
+		"id":      "chatcmpl-test",
+		"object":  "chat.completion",
+		"created": 1715000000,
+		"model":   "test-model",
+		"choices": []map[string]interface{}{
+			{
+				"index": 0,
+				"message": map[string]interface{}{
+					"role": "assistant",
+					"tool_calls": []map[string]interface{}{
+						{
+							"id":   callID,
+							"type": "function",
+							"function": map[string]interface{}{
+								"name":      name,
+								"arguments": args,
+							},
+						},
+					},
+				},
+				"finish_reason": "tool_calls",
+			},
+		},
+		"usage": map[string]interface{}{
+			"prompt_tokens":     10,
+			"completion_tokens": 5,
+			"total_tokens":      15,
+		},
+	})
+	return string(b)
+}
+
+func TestSearXNGNonStreaming(t *testing.T) {
+	searxngSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("q") != "test query" {
+			t.Errorf("unexpected query: %s", r.URL.Query().Get("q"))
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"results": []map[string]interface{}{
+				{"title": "R1", "url": "https://e.com/1", "content": "content 1"},
+			},
+		})
+	}))
+	defer searxngSrv.Close()
+
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, toolCallResponse("call_testcallid", "web_search", `{"query":"test query"}`))
+	}))
+	defer upstreamSrv.Close()
+
+	p := proxy.New(upstreamSrv.URL, nil)
+	s := searcher.New(0, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
+	h := handler.NewResponsesHandler(p, s, 3)
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(middleware.Trace())
+	r.Use(middleware.Auth())
+	r.POST("/v1/responses", h.Create)
+
+	body := `{"model":"test-model","input":"test query","stream":false}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/responses", bytes.NewReader([]byte(body)))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	output, _ := resp["output"].([]interface{})
+	if len(output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(output))
+	}
+
+	wsItem, _ := output[0].(map[string]interface{})
+	if wsItem["type"] != "web_search_call" {
+		t.Errorf("expected type web_search_call, got %q", wsItem["type"])
+	}
+	if wsItem["id"] != "ws_testcallid" {
+		t.Errorf("expected id ws_testcallid, got %q", wsItem["id"])
+	}
+	action, _ := wsItem["action"].(map[string]interface{})
+	if action["query"] != "test query" {
+		t.Errorf("expected query 'test query', got %q", action["query"])
+	}
+
+	msgItem, _ := output[1].(map[string]interface{})
+	if msgItem["type"] != "message" {
+		t.Errorf("expected type message, got %q", msgItem["type"])
+	}
+	content, _ := msgItem["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("expected 1 content item, got %d", len(content))
+	}
+	part, _ := content[0].(map[string]interface{})
+	text, _ := part["text"].(string)
+	expectedText := "1. R1\nhttps://e.com/1\ncontent 1"
+	if text != expectedText {
+		t.Errorf("expected text %q, got %q", expectedText, text)
+	}
+}
+
+func TestSearXNGStreaming(t *testing.T) {
+	searxngSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"results": []map[string]interface{}{
+				{"title": "R1", "url": "https://e.com/1", "content": "content 1"},
+			},
+		})
+	}))
+	defer searxngSrv.Close()
+
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_testcallid","type":"function","function":{"name":"web_search","arguments":""}}]}}]}`)
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\": \"test query\"}"}}]}}]}`)
+		fmt.Fprintf(w, "data: %s\n\n", `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+	}))
+	defer upstreamSrv.Close()
+
+	p := proxy.New(upstreamSrv.URL, nil)
+	s := searcher.New(0, 10*time.Second, "", 0, "searxng", searxngSrv.URL)
+	h := handler.NewResponsesHandler(p, s, 3)
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(middleware.Trace())
+	r.Use(middleware.Auth())
+	r.POST("/v1/responses", h.Create)
+
+	body := `{"model":"test-model","input":"test query","stream":true}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/responses", bytes.NewReader([]byte(body)))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var completedResponse map[string]interface{}
+	scanner := bufio.NewScanner(bytes.NewReader(w.Body.Bytes()))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		dataStr := strings.TrimPrefix(line, "data: ")
+		var event struct {
+			Type     string                 `json:"type"`
+			Response map[string]interface{} `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(dataStr), &event); err != nil {
+			continue
+		}
+		if event.Type == "response.completed" {
+			completedResponse = event.Response
+		}
+	}
+
+	if completedResponse == nil {
+		t.Fatal("no response.completed event found")
+	}
+
+	output, _ := completedResponse["output"].([]interface{})
+	if len(output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(output))
+	}
+
+	wsItem, _ := output[0].(map[string]interface{})
+	if wsItem["type"] != "web_search_call" {
+		t.Errorf("expected type web_search_call, got %q", wsItem["type"])
+	}
+	if wsItem["id"] != "ws_testcallid" {
+		t.Errorf("expected id ws_testcallid, got %q", wsItem["id"])
+	}
+
+	msgItem, _ := output[1].(map[string]interface{})
+	if msgItem["type"] != "message" {
+		t.Errorf("expected type message, got %q", msgItem["type"])
+	}
+	content, _ := msgItem["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("expected 1 content item, got %d", len(content))
+	}
+	part, _ := content[0].(map[string]interface{})
+	text, _ := part["text"].(string)
+	expectedText := "1. R1\nhttps://e.com/1\ncontent 1"
+	if text != expectedText {
+		t.Errorf("expected text %q, got %q", expectedText, text)
 	}
 }

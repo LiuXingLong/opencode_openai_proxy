@@ -9,7 +9,7 @@ import (
 )
 
 func TestSearchBeijingWeather(t *testing.T) {
-	s := New(10, 30*time.Second, "https://www.bing.com/search?q=", 5)
+	s := New(10, 30*time.Second, "https://www.bing.com/search?q=", 5, "", "")
 	results := s.Search(context.Background(), "今天北京天气如何")
 
 	if len(results) == 0 {
@@ -37,7 +37,7 @@ func TestSearchBeijingWeather(t *testing.T) {
 }
 
 func TestSearchFinalPrompt(t *testing.T) {
-	s := New(10, 30*time.Second, "https://www.bing.com/search?q=", 5)
+	s := New(10, 30*time.Second, "https://www.bing.com/search?q=", 5, "", "")
 	results := s.Search(context.Background(), "今天北京天气如何")
 
 	if len(results) == 0 {

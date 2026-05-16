@@ -41,17 +41,19 @@ func (h *ResponsesHandler) Create(c *gin.Context) {
 		return
 	}
 
-	l.Info("incoming request",
-		"method", c.Request.Method,
-		"path", c.Request.URL.Path,
-		"body", string(body),
-	)
-
 	var reqMeta struct {
 		Model  string `json:"model"`
 		Stream bool   `json:"stream"`
 	}
 	json.Unmarshal(body, &reqMeta)
+
+	l.Info("incoming request",
+		"method", c.Request.Method,
+		"path", c.Request.URL.Path,
+		"model", reqMeta.Model,
+		"stream", reqMeta.Stream,
+		"body", string(body),
+	)
 
 	chatReqBody, err := converter.ConvertRequest(body)
 	if err != nil {
@@ -81,7 +83,7 @@ func (h *ResponsesHandler) Create(c *gin.Context) {
 	}
 
 	if reqMeta.Stream {
-		h.handleStreaming(c, upstreamResp.Body, chatReqBody, authHeader, start, l)
+		h.handleStreaming(c, upstreamResp.Body, chatReqBody, authHeader, start, l, reqMeta.Model)
 	} else {
 		h.handleNonStreaming(c, upstreamResp.Body, chatReqBody, authHeader, start, l)
 	}
@@ -97,6 +99,11 @@ func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Re
 
 	toolCallID, query := extractWebSearchToolCall(rawBody)
 	if toolCallID != "" {
+		if h.Searcher.Backend() == "searxng" {
+			h.handleSearXNGNonStreaming(c, rawBody, query, toolCallID, start, l)
+			return
+		}
+
 		var finalMsgText string
 		totalAttempts := h.retryCount + 1
 
@@ -145,7 +152,14 @@ func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Re
 		)
 
 		converted := buildSearchResponse(rawBody, finalMsgText)
+		var respMeta struct {
+			ID    string `json:"id"`
+			Model string `json:"model"`
+		}
+		json.Unmarshal(converted, &respMeta)
 		l.Info("outgoing response",
+			"resp_id", respMeta.ID,
+			"model", respMeta.Model,
 			"status", http.StatusOK,
 			"duration", time.Since(start).String(),
 			"body", string(converted),
@@ -161,7 +175,14 @@ func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Re
 		return
 	}
 
+	var respMeta struct {
+		ID    string `json:"id"`
+		Model string `json:"model"`
+	}
+	json.Unmarshal(converted, &respMeta)
 	l.Info("outgoing response",
+		"resp_id", respMeta.ID,
+		"model", respMeta.Model,
 		"status", http.StatusOK,
 		"duration", time.Since(start).String(),
 		"body", string(converted),
@@ -170,8 +191,8 @@ func (h *ResponsesHandler) handleNonStreaming(c *gin.Context, upstreamBody io.Re
 	c.Data(http.StatusOK, "application/json", converted)
 }
 
-func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reader, originalBody []byte, authHeader string, start time.Time, l *slog.Logger) {
-	state := converter.NewStreamState("", time.Now().Unix())
+func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reader, originalBody []byte, authHeader string, start time.Time, l *slog.Logger, model string) {
+	state := converter.NewStreamState(model, time.Now().Unix())
 
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
@@ -220,7 +241,12 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 				isBuiltin := converter.IsBuiltinTool(name)
 				fcIsBuiltin[tcd.Index] = isBuiltin
 				if isBuiltin {
-					itemID := "ws_" + uuid.New().String()
+					var itemID string
+					if h.Searcher.Backend() == "searxng" && tcd.ID != "" {
+						itemID = "ws_" + strings.TrimPrefix(tcd.ID, "call_")
+					} else {
+						itemID = "ws_" + uuid.New().String()
+					}
 					fcItemIDs[tcd.Index] = itemID
 					fcEvent := converter.BuildStreamBuiltinToolItemAddedEvent(itemID, name+"_call", oidx)
 					fmt.Fprint(c.Writer, fcEvent)
@@ -395,114 +421,118 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 				}
 
 				if searchQuery != "" {
-					var accumulatedText string
-					totalAttempts := h.retryCount + 1
-					gotAnswer := false
+					if h.Searcher.Backend() == "searxng" {
+						h.handleSearXNGStreamingSearch(c, state, searchQuery, searchCallID, &output, l)
+					} else {
+						var accumulatedText string
+						totalAttempts := h.retryCount + 1
+						gotAnswer := false
 
-					for attempt := 0; attempt < totalAttempts; attempt++ {
-						if attempt > 0 {
-							l.Info("search: retrying", "query", searchQuery, "attempt", attempt+1, "max", totalAttempts)
-						}
-
-						results := h.Searcher.Search(c.Request.Context(), searchQuery)
-						if len(results) == 0 {
-							continue
-						}
-
-						resultsJSON, _ := json.Marshal(map[string]interface{}{
-							"query":       searchQuery,
-							"search_time": time.Now().Format("2006-01-02 15:04"),
-							"results":     results,
-						})
-						l.Info("search: feeding results to model",
-							"query", searchQuery,
-							"result_count", len(results),
-							"results_json", string(resultsJSON),
-						)
-
-						reInvokeBody, err := converter.BuildReInvokeRequest(originalBody, searchQuery, resultsJSON, searchCallID)
-						if err != nil {
-							continue
-						}
-
-						reInvokeResp, err := h.Proxy.Send(c.Request.Context(), c.Request.URL.Path, reInvokeBody, authHeader)
-						if err != nil || reInvokeResp.StatusCode != http.StatusOK {
-							if reInvokeResp != nil {
-								reInvokeResp.Body.Close()
+						for attempt := 0; attempt < totalAttempts; attempt++ {
+							if attempt > 0 {
+								l.Info("search: retrying", "query", searchQuery, "attempt", attempt+1, "max", totalAttempts)
 							}
-							continue
-						}
 
-						reInvokeScanner := bufio.NewScanner(reInvokeResp.Body)
-						reInvokeScanner.Buffer(make([]byte, 0, 1024*64), 1024*1024)
-
-						accumulatedText = ""
-						for reInvokeScanner.Scan() {
-							rt, rFinish, _, _, _ := converter.ParseChatStreamLine(reInvokeScanner.Text())
-							if rt != "" {
-								accumulatedText += rt
+							results := h.Searcher.Search(c.Request.Context(), searchQuery)
+							if len(results) == 0 {
+								continue
 							}
-							if rFinish != "" {
+
+							resultsJSON, _ := json.Marshal(map[string]interface{}{
+								"query":       searchQuery,
+								"search_time": time.Now().Format("2006-01-02 15:04"),
+								"results":     results,
+							})
+							l.Info("search: feeding results to model",
+								"query", searchQuery,
+								"result_count", len(results),
+								"results_json", string(resultsJSON),
+							)
+
+							reInvokeBody, err := converter.BuildReInvokeRequest(originalBody, searchQuery, resultsJSON, searchCallID)
+							if err != nil {
+								continue
+							}
+
+							reInvokeResp, err := h.Proxy.Send(c.Request.Context(), c.Request.URL.Path, reInvokeBody, authHeader)
+							if err != nil || reInvokeResp.StatusCode != http.StatusOK {
+								if reInvokeResp != nil {
+									reInvokeResp.Body.Close()
+								}
+								continue
+							}
+
+							reInvokeScanner := bufio.NewScanner(reInvokeResp.Body)
+							reInvokeScanner.Buffer(make([]byte, 0, 1024*64), 1024*1024)
+
+							accumulatedText = ""
+							for reInvokeScanner.Scan() {
+								rt, rFinish, _, _, _ := converter.ParseChatStreamLine(reInvokeScanner.Text())
+								if rt != "" {
+									accumulatedText += rt
+								}
+								if rFinish != "" {
+									break
+								}
+							}
+							reInvokeResp.Body.Close()
+
+							l.Info("search: re-invoke response",
+								"query", searchQuery,
+								"attempt", attempt,
+								"response_text", accumulatedText,
+							)
+
+							if accumulatedText != "" && !strings.HasPrefix(accumulatedText, "SEARCH_RESULT_INSUFFICIENT") {
+								gotAnswer = true
 								break
 							}
-						}
-						reInvokeResp.Body.Close()
-
-						l.Info("search: re-invoke response",
-							"query", searchQuery,
-							"attempt", attempt,
-							"response_text", accumulatedText,
-						)
-
-						if accumulatedText != "" && !strings.HasPrefix(accumulatedText, "SEARCH_RESULT_INSUFFICIENT") {
-							gotAnswer = true
-							break
-						}
-						if strings.HasPrefix(accumulatedText, "SEARCH_RESULT_INSUFFICIENT") {
-							l.Info("search: model reported insufficient results",
-								"query", searchQuery, "attempt", attempt, "response", accumulatedText)
-						}
-					}
-
-					if gotAnswer {
-						msgID := "msg_" + uuid.New().String()
-						msgOidx := state.NextOutputIndex()
-
-						msgAddEvent := converter.BuildStreamItemAddedEvent(msgID, "assistant", msgOidx)
-						fmt.Fprint(c.Writer, msgAddEvent)
-
-						if accumulatedText != "" {
-							deltaEvent := converter.BuildStreamTextDeltaEvent(msgID, accumulatedText, msgOidx, 0)
-							fmt.Fprint(c.Writer, deltaEvent)
+							if strings.HasPrefix(accumulatedText, "SEARCH_RESULT_INSUFFICIENT") {
+								l.Info("search: model reported insufficient results",
+									"query", searchQuery, "attempt", attempt, "response", accumulatedText)
+							}
 						}
 
-						doneEvent := converter.BuildStreamTextDoneEvent(msgID, accumulatedText, msgOidx, 0)
-						fmt.Fprint(c.Writer, doneEvent)
+						if gotAnswer {
+							msgID := "msg_" + uuid.New().String()
+							msgOidx := state.NextOutputIndex()
 
-						contentArr := []map[string]interface{}{}
-						if accumulatedText != "" {
-							contentArr = append(contentArr, map[string]interface{}{
-								"type":        "output_text",
-								"text":        accumulatedText,
-								"annotations": []interface{}{},
-							})
+							msgAddEvent := converter.BuildStreamItemAddedEvent(msgID, "assistant", msgOidx)
+							fmt.Fprint(c.Writer, msgAddEvent)
+
+							if accumulatedText != "" {
+								deltaEvent := converter.BuildStreamTextDeltaEvent(msgID, accumulatedText, msgOidx, 0)
+								fmt.Fprint(c.Writer, deltaEvent)
+							}
+
+							doneEvent := converter.BuildStreamTextDoneEvent(msgID, accumulatedText, msgOidx, 0)
+							fmt.Fprint(c.Writer, doneEvent)
+
+							contentArr := []map[string]interface{}{}
+							if accumulatedText != "" {
+								contentArr = append(contentArr, map[string]interface{}{
+									"type":        "output_text",
+									"text":        accumulatedText,
+									"annotations": []interface{}{},
+								})
+							}
+							msgItem := map[string]interface{}{
+								"id":      msgID,
+								"type":    "message",
+								"role":    "assistant",
+								"content": contentArr,
+							}
+							msgDoneEvent := converter.BuildStreamOutputItemDoneEvent(msgID, msgOidx, msgItem)
+							fmt.Fprint(c.Writer, msgDoneEvent)
+							output = append(output, msgItem)
+						} else {
+							fallbackText := "当前未搜索到相关信息，请调整查询词后重试。"
+							l.Warn("search: all retries exhausted, using fallback",
+								"query", searchQuery,
+								"fallback", fallbackText,
+							)
+							output = append(output, appendFallbackMessage(c, state, fallbackText)...)
 						}
-						msgItem := map[string]interface{}{
-							"id":      msgID,
-							"type":    "message",
-							"role":    "assistant",
-							"content": contentArr,
-						}
-						msgDoneEvent := converter.BuildStreamOutputItemDoneEvent(msgID, msgOidx, msgItem)
-						fmt.Fprint(c.Writer, msgDoneEvent)
-						output = append(output, msgItem)
-					} else {
-						fallbackText := "当前未搜索到相关信息，请调整查询词后重试。"
-						l.Warn("search: all retries exhausted, using fallback",
-							"query", searchQuery,
-							"fallback", fallbackText,
-						)
-						output = append(output, appendFallbackMessage(c, state, fallbackText)...)
 					}
 				} else {
 					l.Warn("search: empty query, using fallback",
@@ -514,6 +544,9 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 			}
 
 			l.Info("sending response.completed",
+				"resp_id", state.RespID,
+				"model", state.Model,
+				"status", status,
 				"output", output,
 				"usage", fmt.Sprintf(`{"input_tokens":%d,"output_tokens":%d}`, state.PromptTokens, state.CompletionTokens),
 			)
@@ -534,10 +567,11 @@ func (h *ResponsesHandler) handleStreaming(c *gin.Context, upstreamBody io.Reade
 	}
 
 	l.Info("outgoing response",
+		"resp_id", state.RespID,
+		"model", state.Model,
 		"status", http.StatusOK,
 		"duration", time.Since(start).String(),
 		"type", "stream",
-		"model", state.Model,
 		"text_length", len(state.AccumulatedText),
 		"has_text", state.HasContent,
 		"tool_call_count", len(state.ToolCalls),
@@ -712,4 +746,146 @@ func buildSearchResponse(originalRespBody []byte, msgText string) []byte {
 	}
 	b, _ := json.Marshal(resp)
 	return b
+}
+
+func (h *ResponsesHandler) handleSearXNGNonStreaming(c *gin.Context, rawBody []byte, query, callID string, start time.Time, l *slog.Logger) {
+	results := h.Searcher.Search(c.Request.Context(), query)
+	resultsText := formatSearchResults(results)
+	if len(results) > 0 {
+		resultsJSON, _ := json.Marshal(map[string]interface{}{
+			"query":       query,
+			"search_time": time.Now().Format("2006-01-02 15:04"),
+			"results":     results,
+		})
+		l.Info("search: searxng results", "query", query, "result_count", len(results), "results_json", string(resultsJSON))
+	}
+
+	converted := buildSearXNGSearchResponse(rawBody, query, callID, resultsText)
+	var respMeta struct {
+		ID    string `json:"id"`
+		Model string `json:"model"`
+	}
+	json.Unmarshal(converted, &respMeta)
+	l.Info("outgoing response",
+		"resp_id", respMeta.ID,
+		"model", respMeta.Model,
+		"status", http.StatusOK,
+		"duration", time.Since(start).String(),
+		"body", string(converted),
+	)
+	c.Data(http.StatusOK, "application/json", converted)
+}
+
+func (h *ResponsesHandler) handleSearXNGStreamingSearch(c *gin.Context, state *converter.StreamState, searchQuery, searchCallID string, output *[]map[string]interface{}, l *slog.Logger) {
+	results := h.Searcher.Search(c.Request.Context(), searchQuery)
+	resultsText := formatSearchResults(results)
+	if len(results) > 0 {
+		resultsJSON, _ := json.Marshal(map[string]interface{}{
+			"query":       searchQuery,
+			"search_time": time.Now().Format("2006-01-02 15:04"),
+			"results":     results,
+		})
+		l.Info("search: searxng results", "query", searchQuery, "result_count", len(results), "results_json", string(resultsJSON))
+	}
+
+	msgID := "msg_" + uuid.New().String()
+	msgOidx := state.NextOutputIndex()
+
+	state.AccumulatedText = resultsText
+	state.HasContent = resultsText != ""
+
+	msgAddEvent := converter.BuildStreamItemAddedEvent(msgID, "assistant", msgOidx)
+	fmt.Fprint(c.Writer, msgAddEvent)
+
+	if resultsText != "" {
+		deltaEvent := converter.BuildStreamTextDeltaEvent(msgID, resultsText, msgOidx, 0)
+		fmt.Fprint(c.Writer, deltaEvent)
+	}
+
+	doneEvent := converter.BuildStreamTextDoneEvent(msgID, resultsText, msgOidx, 0)
+	fmt.Fprint(c.Writer, doneEvent)
+
+	msgItem := map[string]interface{}{
+		"id":   msgID,
+		"type": "message",
+		"role": "assistant",
+		"content": []map[string]interface{}{
+			{"type": "output_text", "text": resultsText, "annotations": []interface{}{}},
+		},
+	}
+	msgDoneEvent := converter.BuildStreamOutputItemDoneEvent(msgID, msgOidx, msgItem)
+	fmt.Fprint(c.Writer, msgDoneEvent)
+	*output = append(*output, msgItem)
+}
+
+func buildSearXNGSearchResponse(originalRespBody []byte, query, callID, text string) []byte {
+	var chatResp struct {
+		Model string `json:"model"`
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage,omitempty"`
+	}
+	json.Unmarshal(originalRespBody, &chatResp)
+
+	wsID := "ws_" + strings.TrimPrefix(callID, "call_")
+
+	output := []map[string]interface{}{
+		{
+			"id":     wsID,
+			"type":   "web_search_call",
+			"status": "completed",
+			"action": map[string]interface{}{
+				"type":    "search",
+				"query":   query,
+				"queries": []string{query},
+			},
+		},
+		{
+			"id":   "msg_" + uuid.New().String(),
+			"type": "message",
+			"role": "assistant",
+			"content": []map[string]interface{}{
+				{"type": "output_text", "text": text, "annotations": []interface{}{}},
+			},
+		},
+	}
+
+	inputTokens := 0
+	outputTokens := 0
+	if chatResp.Usage != nil {
+		inputTokens = chatResp.Usage.PromptTokens
+		outputTokens = chatResp.Usage.CompletionTokens
+	}
+
+	resp := map[string]interface{}{
+		"id":         "resp_" + uuid.New().String(),
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"model":      chatResp.Model,
+		"status":     "completed",
+		"output":     output,
+		"usage": map[string]interface{}{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+			"total_tokens":  inputTokens + outputTokens,
+		},
+	}
+	b, _ := json.Marshal(resp)
+	return b
+}
+
+func formatSearchResults(results []searcher.SearchResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, r := range results {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		fmt.Fprintf(&b, "%d. %s\n%s\n%s", i+1, r.Title, r.URL, r.PageContent)
+	}
+	return b.String()
 }

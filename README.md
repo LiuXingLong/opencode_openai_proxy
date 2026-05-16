@@ -11,6 +11,7 @@ OpenAI Responses API 代理 — 将 `/v1/responses` 请求转换为 `/v1/chat/co
 - **流式响应**：SSE 事件格式转换（`response.created`、`output_text.delta`、`function_call_arguments.delta`、`output_item.done`、`response.completed`）
 - **工具调用**：支持 `tools` 参数和 `function_call_output` 输入转换
 - **内置工具映射**：`web_search` 等内置工具自动映射为 function 格式
+- **搜索后端**：支持 Bing 和 SearXNG 两种搜索后端，通过环境变量切换
 
 ## 架构
 
@@ -71,6 +72,8 @@ UPSTREAM_BASE_URL=https://your-upstream.com/zen docker compose up -d
 | `UPSTREAM_ROUTES` | - | 按路径前缀分发的路由表，JSON 格式。最长前缀匹配，未匹配时回退到 `UPSTREAM_BASE_URL` |
 | `LISTEN_ADDR` | `:8082` | 代理监听地址 |
 | `LOG_FILE` | `./logs/proxy.log` | 日志文件路径 |
+| `SEARCH_BACKEND` | `bing` | 搜索后端：`bing` 或 `searxng` |
+| `SEARXNG_BASE_URL` | `http://localhost:8086` | SearXNG 服务地址（仅 `SEARCH_BACKEND=searxng` 时使用） |
 
 ### 路径路由
 
@@ -91,6 +94,18 @@ curl -X POST http://localhost:8082/v1/responses \
 curl -X POST http://localhost:8082/ollama/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-oss:20b","input":"你好","stream":false}'
+```
+
+### 搜索后端
+
+`SEARCH_BACKEND=searxng` 时，`web_search` 工具调用将使用 SearXNG 搜索，结果直接返回给客户端（跳过模型重请求）。`SEARCH_BACKEND=bing`（默认）时，结果会重新请求模型生成答案。
+
+```bash
+# 使用 SearXNG 后端
+SEARCH_BACKEND=searxng ./opencode-openai-proxy
+
+# 使用 Bing 后端（默认）
+SEARCH_BACKEND=bing ./opencode-openai-proxy
 ```
 
 ## API 使用
@@ -266,6 +281,13 @@ opencode_openai_proxy/
 │   ├── request.go       # 请求转换
 │   └── response.go      # 响应转换（非流式 + 流式）
 ├── proxy/proxy.go       # 上游转发（含路径路由选择）
+├── searcher/
+│   ├── searcher.go       # 搜索接口（支持后端切换）
+│   ├── bing.go           # Bing 搜索实现
+│   ├── searxng.go        # SearXNG 搜索实现
+│   ├── fetcher.go        # 页面抓取
+│   ├── search_test.go    # 搜索测试
+│   └── searxng_test.go   # SearXNG 搜索测试
 ├── handler/
 │   ├── responses.go     # /v1/responses 端点
 │   └── health.go        # /health 端点

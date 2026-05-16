@@ -17,6 +17,8 @@ type Config struct {
 	SearchBingURL     string
 	SearchConcurrency int
 	SearchRetryCount  int
+	SearchBackend     string
+	SearXNGBaseURL    string
 }
 
 func Load() *Config {
@@ -35,6 +37,8 @@ func Load() *Config {
 		SearchBingURL:     getEnv("BING_SEARCH_URL", "https://www.bing.com/search?q="),
 		SearchConcurrency: getEnvInt("BING_SEARCH_CONCURRENCY", defaultResultCount),
 		SearchRetryCount:  getEnvInt("SEARCH_RETRY_COUNT", 3),
+		SearchBackend:     getEnv("SEARCH_BACKEND", "bing"),
+		SearXNGBaseURL:    getEnv("SEARXNG_BASE_URL", "http://localhost:8086"),
 	}
 }
 
