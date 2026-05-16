@@ -1,0 +1,19 @@
+# 编译输出
+*.exe
+*.test
+*.out
+
+# 依赖缓存
+vendor/
+
+# 日志
+logs/
+
+# 环境/编辑器
+.env
+.env.example
+.idea
+.vscode
+.DS_Store
+node_modules
+dist

@@ -6,9 +6,12 @@ PID_FILE="/tmp/${APP_NAME}.pid"
 LOG_DIR="./logs"
 GO_BIN="/Users/xinglongliu/go/go1.25.8/bin/go"
 
+# GOROOT=/Users/xinglongliu/go/go1.25.8 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 /Users/xinglongliu/go/go1.25.8/bin/go build -ldflags="-s -w" -o opencode-openai-proxy .
+
 build() {
     echo "==> 编译 $APP_NAME ..."
     GOROOT=/Users/xinglongliu/go/go1.25.8 $GO_BIN build -o "$APP_NAME" .
+    GOROOT=/Users/xinglongliu/go/go1.25.8 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $GO_BIN build -ldflags="-s -w" -o "$APP_NAME-docker" .
     echo "    完成: ./$APP_NAME"
 }
 

@@ -1,5 +1,6 @@
 logs
 opencode-openai-proxy
+opencode-openai-proxy-docker
 .env
 .vscode
 .idea
