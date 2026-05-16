@@ -1,369 +1,393 @@
-# opencode-openai-proxy 架构与流程
+# opencode-openai-proxy 架构图
 
-## 一、整体架构图
+## 一、整体系统架构图
 
 ```mermaid
 graph TB
-    subgraph 客户端
-        CLI[Codex CLI / OpenAI SDK]
+    subgraph 客户端[客户端]
+        CLI[Codex CLI / @ai-sdk/openai]
     end
 
-    subgraph opencode-openai-proxy
+    subgraph 代理[opencode-openai-proxy]
         direction TB
+
         subgraph 入口层
             GIN[Gin Router]
-            MID_Trace[中间件: Trace]
-            MID_Auth[中间件: Auth]
+            MID_TRACE[Trace 中间件<br/>trace_id 注入]
+            MID_AUTH[Auth 中间件<br/>认证透传]
         end
 
-        subgraph 处理层
-            Handler[ResponsesHandler]
+        subgraph 核心处理层
+            HANDLER[ResponsesHandler<br/>请求编排总入口]
         end
 
         subgraph 协议转换层
-            CR[converter/request.go<br/>Responses → Chat]
-            CRP[converter/response.go<br/>Chat → Responses]
+            REQ_CONV[converter/request.go<br/>Responses API → Chat Completions]
+            RESP_CONV[converter/response.go<br/>Chat Completions → Responses API<br/>+ SSE 事件构建]
         end
 
-        subgraph 代理层
-            Proxy[proxy.Proxy<br/>上游 HTTP 客户端]
+        subgraph 代理转发层
+            PROXY[proxy.Proxy<br/>路由选择 + HTTP 转发]
         end
 
-        subgraph 搜索层
-            Searcher[Searcher]
-            Bing[Bing 后端]
-            SearXNG[SearXNG 后端]
-            Fetcher[页面抓取器]
+        subgraph 搜索集成层
+            SEARCHER[Searcher<br/>统一搜索接口]
+            BING[Bing 后端<br/>HTML 解析 + 页面抓取]
+            SEARXNG[SearXNG 后端<br/>JSON API 调用]
+            FETCHER[页面抓取器<br/>并发 + goquery 解析]
         end
 
-        subgraph 基础服务
-            Logger[结构化日志]
-            Config[环境变量配置]
+        subgraph 基础服务层
+            CONFIG[config<br/>环境变量配置]
+            LOGGER[logger<br/>JSON 结构化日志]
         end
     end
 
-    subgraph 上游
-        UP[Chat Completions API]
+    subgraph 上游[上游服务]
+        UPSTREAM_A[opencode.ai/zen]
+        UPSTREAM_B[Ollama 本地]
+        UPSTREAM_C[其他 Chat API]
     end
 
-    CLI -->|POST /v1/responses| GIN
-    GIN --> MID_Trace --> MID_Auth --> Handler
-    Handler -->|转换请求| CR
-    CR -->|ChatCompletion 请求体| Proxy
-    Proxy -->|POST /v1/chat/completions| UP
-    UP -->|流式/非流式响应| Proxy
-    Proxy -->|上游响应体| Handler
-    Handler -->|转换响应| CRP
-    CRP -->|Responses API 响应| Handler
-    Handler -->|SSE 或 JSON| CLI
+    CLI -->|"POST /v1/responses<br/>JSON"| GIN
+    GIN --> MID_TRACE --> MID_AUTH --> HANDLER
+    HANDLER -->|"转换请求"| REQ_CONV
+    REQ_CONV -->|"Chat Completions JSON"| PROXY
+    PROXY -->|"POST /v1/chat/completions"| UPSTREAM_A
+    PROXY -->|"POST /v1/chat/completions"| UPSTREAM_B
+    PROXY -->|"POST /v1/chat/completions"| UPSTREAM_C
+    UPSTREAM_A -->|"JSON / SSE"| PROXY
+    UPSTREAM_B -->|"JSON / SSE"| PROXY
+    UPSTREAM_C -->|"JSON / SSE"| PROXY
+    PROXY -->|"原始响应"| HANDLER
+    HANDLER -->|"转换响应"| RESP_CONV
+    RESP_CONV -->|"Responses API 格式<br/>JSON / SSE"| CLI
 
-    Handler -.->|web_search 触发| Searcher
-    Searcher -.-> Bing
-    Searcher -.-> SearXNG
-    Searcher -.-> Fetcher
-    Searcher -.->|搜索结果| Handler
-    Handler -.->|搜索结果+问题 → 模型总结| Proxy
+    HANDLER -.->|"web_search 触发"| SEARCHER
+    SEARCHER -.-> BING
+    SEARCHER -.-> SEARXNG
+    BING -.-> FETCHER
+    SEARCHER -.->|"搜索结果"| HANDLER
+    HANDLER -.->|"搜索结果重请求"| PROXY
+
+    CONFIG -.-> HANDLER
+    CONFIG -.-> PROXY
+    LOGGER -.-> HANDLER
+    LOGGER -.-> PROXY
+    LOGGER -.-> SEARCHER
 ```
 
-## 二、请求处理流程
+---
 
-### 2.1 核心调用链
-
-```mermaid
-sequenceDiagram
-    participant Client as Codex CLI
-    participant Gin as Gin Router
-    participant MW as Middleware
-    participant H as ResponsesHandler
-    participant CR as converter/request
-    participant P as Proxy
-    participant Upstream as Chat API
-    participant CRP as converter/response
-
-    Client->>+Gin: POST /v1/responses (JSON)
-    Gin->>+MW: 请求进入
-    MW-->>MW: Trace: 注入 trace_id
-    MW-->>MW: Auth: 提取 Authorization
-    MW-->>-H: 请求到达 Handler
-
-    H->>+CR: ConvertRequest(body)
-    CR-->>CR: 解析 Responses Request
-    CR-->>CR: 转换 input 为 messages
-    CR-->>CR: 转换 tools (过滤 web_search)
-    CR-->>CR: 映射参数 (max_output_tokens→max_tokens)
-    CR-->>-H: 返回 ChatCompletionsRequest JSON
-
-    H->>+P: Send(path, chatReqBody, authHeader)
-    P-->>P: selectBaseURL(path): 路由匹配
-    P->>+Upstream: POST /v1/chat/completions
-    Upstream-->>-P: 响应体 (JSON 或 SSE)
-    P-->>-H: http.Response
-
-    alt 非流式
-        H->>+CRP: ConvertNonStreamingResponse(body)
-        CRP-->>CRP: 解析 Chat Choice
-        CRP-->>CRP: 构建 output_text/function_call 项
-        CRP-->>-H: Responses Response JSON
-        H-->>Client: 200 JSON
-
-    else 流式
-        H-->>Client: 200 SSE (text/event-stream)
-        H->>+CRP: BuildStreamCreatedEvent
-        CRP-->>-H: response.created 事件
-        loop 每条 SSE 行
-            H->>+CRP: ParseChatStreamLine(line)
-            CRP-->>-H: deltaText, toolCallDeltas, finishReason
-            alt 有文本
-                H-->>Client: response.output_text.delta
-            end
-            alt 有函数调用
-                H-->>Client: response.output_item.added (function_call)
-                H-->>Client: response.function_call_arguments.delta
-            end
-            alt 结束
-                H-->>Client: response.output_text.done
-                H-->>Client: response.output_item.done
-                H-->>Client: response.completed
-            end
-        end
-    end
-```
-
-### 2.2 搜索流程（非流式 / Bing 后端）
-
-```mermaid
-sequenceDiagram
-    participant H as ResponsesHandler
-    participant S as Searcher
-    participant Fetcher as 页面抓取
-    participant P as Proxy
-    participant Upstream as Chat API
-
-    H->>H: extractWebSearchToolCall(rawBody)
-    Note over H: 检查上游响应中是否有 web_search tool_call
-
-    alt 检测到 web_search
-        H->>+S: Search(query)
-        S->>S: searchBing(query) ← 解析 Bing SERP HTML
-        S->>+Fetcher: fetchPages(results)
-        Fetcher-->>-S: 页面正文 (前5000字符)
-        S-->>-H: []SearchResult
-
-        loop 最多 retryCount+1 次
-            H->>+P: BuildReInvokeRequest(原始请求, 搜索结果)
-            P->>+Upstream: 带搜索结果的二次请求
-            Upstream-->>-P: 模型回答
-            P-->>-H: 响应体
-            H->>H: extractContentFromResponse()
-            Note over H: 检查是否为 SEARCH_RESULT_INSUFFICIENT
-            alt 结果有效
-                break
-            end
-        end
-
-        H->>H: buildSearchResponse(原始响应, 最终文本)
-        H-->>Client: Responses API JSON
-    else 无 web_search
-        H->>H: ConvertNonStreamingResponse(rawBody)
-        H-->>Client: 直接转换后的响应
-    end
-```
-
-### 2.3 搜索流程（流式 / Bing 后端）
-
-```mermaid
-sequenceDiagram
-    participant Client as Codex CLI
-    participant H as ResponsesHandler
-    participant S as Searcher
-    participant P as Proxy
-    participant Upstream as Chat API
-
-    Note over H: 流式解析进行中...
-
-    H->>Client: response.created
-    H->>Client: response.output_item.added (web_search_call)
-
-    loop 流式行
-        H->>H: ParseChatStreamLine(line)
-        alt 工具调用出现
-            H->>Client: response.output_item.added (builtin tool)
-            alt 文本增量
-                H->>Client: response.output_text.delta
-            end
-        end
-    end
-
-    Note over H: 所有工具调用完成，检查是否全是 web_search
-
-    alt 全部是 web_search
-        H->>+S: Search(query)
-        S-->>-H: 搜索结果
-
-        loop 最多 retryCount+1 次
-            H->>+P: 二次请求 (搜索结果+原始问题)
-            P->>+Upstream: POST chat/completions
-            Upstream-->>-P: 流式回答
-            P-->>-H: 响应体
-            H->>H: 解析流式行 → 累积文本
-            alt 回答有效
-                break
-            end
-        end
-
-        H->>Client: response.output_item.added (新 message)
-        H->>Client: response.output_text.delta / done
-        H->>Client: response.output_item.done
-    end
-
-    H->>Client: response.completed
-```
-
-### 2.4 SearXNG 搜索流程
-
-```mermaid
-sequenceDiagram
-    participant H as ResponsesHandler
-    participant S as Searcher
-    participant SearXNG as SearXNG Service
-    participant P as Proxy
-    participant Upstream as Chat API
-
-    H->>+S: Search(query)
-    S->>+SearXNG: GET /search?q=...&format=json
-    SearXNG-->>-S: JSON 结果 (title, url, content)
-    S-->>-H: []SearchResult
-
-    alt SEARXNG_SUMMARIZE=true
-        H->>+P: BuildReInvokeRequest → 模型总结搜索结果
-        P->>+Upstream: POST (总结请求)
-        Upstream-->>-P: 模型总结文本
-        P-->>-H: 总结结果
-    end
-
-    alt 非流式
-        H->>H: buildSearXNGSearchResponse()
-        Note over H: 构建含 web_search_call + message 的响应
-        H-->>Client: JSON
-    else 流式
-        H->>Client: response.output_item.added (message)
-        H->>Client: response.output_text.delta/done
-        H->>Client: response.output_item.done
-        H->>Client: response.completed
-    end
-```
-
-## 三、包依赖关系
+## 二、模块依赖关系图
 
 ```mermaid
 graph TD
-    main --> config
-    main --> handler
-    main --> middleware
-    main --> proxy
-    main --> searcher
-    main --> logger
+    MAIN["main.go<br/>入口：路由注册、初始化"] --> CONFIG["config<br/>配置加载"]
+    MAIN --> LOGGER["logger<br/>日志系统"]
+    MAIN --> MIDDLEWARE["middleware<br/>Trace + Auth"]
+    MAIN --> HANDLER["handler<br/>ResponsesHandler"]
+    MAIN --> PROXY["proxy<br/>HTTP 转发"]
+    MAIN --> SEARCHER["searcher<br/>搜索集成"]
 
-    handler --> converter
-    handler --> proxy
-    handler --> searcher
-    handler --> middleware
-    handler --> logger
+    MIDDLEWARE --> LOGGER
 
-    proxy --> logger
+    HANDLER --> CONVERTER["converter<br/>协议转换"]
+    HANDLER --> PROXY
+    HANDLER --> SEARCHER
+    HANDLER --> MIDDLEWARE
+    HANDLER --> LOGGER
 
-    searcher --> logger
+    PROXY --> LOGGER
+
+    SEARCHER --> LOGGER
+    SEARCHER --> BING["bing.go<br/>依赖 goquery"]
+    SEARCHER --> SEARXNG["searxng.go"]
+    SEARCHER --> FETCHER["fetcher.go<br/>依赖 goquery"]
+
+    CONVERTER --> REQ_CONV["request.go<br/>Responses → Chat"]
+    CONVERTER --> RESP_CONV["response.go<br/>Chat → Responses"]
 ```
 
-## 四、数据结构转换映射
+---
 
-### 4.1 Responses API → Chat Completions
+## 三、请求响应数据流图
+
+### 3.1 非流式请求数据流
 
 ```mermaid
 flowchart LR
-    subgraph Responses API
-        R_model[model]
-        R_input[input]
-        R_instructions[instructions]
-        R_maxOutputTokens[max_output_tokens]
-        R_tools[tools:<br/>web_search / function / computer]
-        R_text[text.format]
+    subgraph 入站
+        RAW[原始请求体<br/>JSON bytes]
     end
 
-    subgraph Chat Completions
-        C_model[model]
-        C_messages[messages:<br/>system+user+assistant]
-        C_maxTokens[max_tokens]
-        C_tools[tools:<br/>全部转为 function 类型]
-        C_responseFormat[response_format]
+    subgraph 转换
+        REQ[ResponsesRequest<br/>结构体解析]
+        MSG[[]Message<br/>消息数组]
+        CHAT[ChatCompletionsRequest<br/>JSON bytes]
     end
 
-    R_model --> C_model
-    R_input -->|convertInput()| C_messages
-    R_instructions -->|system 消息| C_messages
-    R_maxOutputTokens --> C_maxTokens
-    R_tools -->|convertTools()<br/>web_search→自定义function| C_tools
-    R_text.format --> C_responseFormat
+    subgraph 转发
+        HTTP[HTTP POST<br/>上游响应]
+    end
+
+    subgraph 响应处理
+        CHECK{"检测<br/>web_search<br/>tool_call?"}
+        SEARCH_PROC[搜索处理<br/>SearXNG / Bing]
+        CONV_RESP[ConvertNonStreamingResponse<br/>Chat → Responses]
+        FINAL[最终响应体<br/>Responses API JSON]
+    end
+
+    RAW -->|json.Unmarshal| REQ
+    REQ -->|convertInput| MSG
+    REQ -->|convertTools| MSG
+    MSG -->|json.Marshal| CHAT
+    CHAT -->|Proxy.Send| HTTP
+    HTTP -->|io.ReadAll| CHECK
+    CHECK -->|无工具调用| CONV_RESP
+    CHECK -->|有 web_search| SEARCH_PROC
+    CONV_RESP --> FINAL
+    SEARCH_PROC --> FINAL
 ```
 
-### 4.2 非流式响应：Chat Completions → Responses API
+### 3.2 流式数据流
 
 ```mermaid
 flowchart LR
-    subgraph Chat 响应
-        CC_choices[choices[0]]
-        CC_message[message]
-        CC_toolCalls[tool_calls]
-        CC_usage[usage]
+    subgraph 上游[上游 SSE 流]
+        LINE["data: {...} 行"]
+        DONE["data: [DONE]"]
     end
 
-    subgraph Responses 响应
-        R_output[output]
-        R_status[status]
-        R_usage[usage]
+    subgraph 解析层[ParseChatStreamLine]
+        DELTA[delta.content]
+        TOOL[delta.tool_calls]
+        FINISH[finish_reason]
+        USAGE[usage]
     end
 
-    CC_message.content -->|output_text| R_output
-    CC_toolCalls -->|function_call / web_search_call| R_output
-    CC_choices.finish_reason -->|MapFinishReason()| R_status
-    CC_usage -->|convertUsage()| R_usage
+    subgraph 事件构建[StreamState + 事件函数]
+        CREATED["response.created"]
+        ITEM_ADDED["response.output_item.added"]
+        TEXT_DELTA["response.output_text.delta"]
+        TEXT_DONE["response.output_text.done"]
+        FC_DELTA["response.function_call_arguments.delta"]
+        FC_DONE["response.function_call_arguments.done"]
+        ITEM_DONE["response.output_item.done"]
+        COMPLETED["response.completed"]
+    end
+
+    subgraph 客户端[Client SSE 流]
+        OUT[SSE 事件序列]
+    end
+
+    LINE --> DELTA
+    LINE --> TOOL
+    LINE --> FINISH
+    LINE --> USAGE
+
+    DELTA -.->|有 content| TEXT_DELTA
+    DELTA -.->|首个 delta| ITEM_ADDED
+    FINISH -.-> TEXT_DONE
+    FINISH -.-> ITEM_DONE
+    FINISH -.-> COMPLETED
+    TOOL -.->|首个出现| ITEM_ADDED
+    TOOL -.->|参数增量| FC_DELTA
+    TOOL -.->|完成| FC_DONE
+    TOOL -.->|完成| ITEM_DONE
+
+    USAGE -.-> COMPLETED
+    DONE -->|跳出循环| COMPLETED
+
+    CREATED --> OUT
+    ITEM_ADDED --> OUT
+    TEXT_DELTA --> OUT
+    TEXT_DONE --> OUT
+    FC_DELTA --> OUT
+    FC_DONE --> OUT
+    ITEM_DONE --> OUT
+    COMPLETED --> OUT
 ```
 
-### 4.3 流式 SSE 事件映射
+---
+
+## 四、搜索架构图
+
+```mermaid
+graph TB
+    SEARCH_TRIGGER["上游响应含 web_search tool_call"]
+
+    SEARCH_TRIGGER --> CHECK_BLOCK{"BLOCK_WEB_SEARCH<br/>是否 true?"}
+
+    CHECK_BLOCK -->|true| SKIP["跳过 web_search<br/>客户端自行处理<br/>= tools 置 nil"]
+    CHECK_BLOCK -->|false| CHECK_BACKEND{"SEARCH_BACKEND<br/>选择"}
+
+    CHECK_BACKEND -->|searxng| SEARXNG_BRANCH
+    CHECK_BACKEND -->|bing| BING_BRANCH
+
+    subgraph SEARXNG_BRANCH[SearXNG 搜索流程]
+        SEARX_API["GET /search?q=X&format=json<br/>调用 SearXNG JSON API"]
+        SEARX_RESULT[解析 results 数组<br/>直接获取结构化结果]
+        CHECK_SUMMARIZE{"SEARXNG_SUMMARIZE<br/>是否 true?"}
+        DIRECT_FMT["直接格式化结果文本<br/>按序号排列"]
+        MODEL_SUMMARIZE["BuildReInvokeRequest<br/>模型总结搜索结果"]
+        BUILD_SEARXNG_RESP["buildSearXNGSearchResponse<br/>构建 web_search_call + message"]
+    end
+
+    subgraph BING_BRANCH[Bing 搜索流程]
+        BING_SCRAPE["searchBing<br/>请求 Bing SERP HTML"]
+        BING_PARSE["goquery 解析<br/>提取 .b_algo 结果"]
+        BING_SERP["提取 SERP 正文<br/>去噪音作为虚拟结果"]
+        FETCH_PAGES["fetchPages<br/>并发抓取结果页面"]
+        FILTER["过滤无页面内容项"]
+        RETRY_LOOP["重试循环<br/>最多 retryCount+1 次"]
+        BUILD_REINVOKE["BuildReInvokeRequest<br/>搜索结果 + 原始问题"]
+        SEND_REINVOKE["Proxy.Send<br/>模型总结"]
+        CHECK_RESULT{"回答有效<br/>非 SEARCH_RESULT<br/>_INSUFFICIENT?"}
+        BUILD_BING_RESP["buildSearchResponse<br/>构建含文本的响应"]
+        FALLBACK["fallback 消息"]
+    end
+
+    SEARX_API --> SEARX_RESULT
+    SEARX_RESULT --> CHECK_SUMMARIZE
+    CHECK_SUMMARIZE -->|false| DIRECT_FMT
+    CHECK_SUMMARIZE -->|true| MODEL_SUMMARIZE
+    DIRECT_FMT --> BUILD_SEARXNG_RESP
+    MODEL_SUMMARIZE --> BUILD_SEARXNG_RESP
+
+    BING_SCRAPE --> BING_PARSE --> BING_SERP --> FETCH_PAGES --> FILTER
+    FILTER --> RETRY_LOOP
+    RETRY_LOOP --> BUILD_REINVOKE --> SEND_REINVOKE --> CHECK_RESULT
+    CHECK_RESULT -->|是| BUILD_BING_RESP
+    CHECK_RESULT -->|否| RETRY_LOOP
+    RETRY_LOOP -->|"全部耗尽"| FALLBACK
+    FALLBACK --> BUILD_BING_RESP
+```
+
+---
+
+## 五、路径路由架构图
+
+```mermaid
+graph TB
+    REQ["请求路径<br/>如 /ollama/v1/responses"]
+
+    REQ --> ROUTE["Proxy.selectBaseURL(path)<br/>最长前缀匹配"]
+
+    subgraph 路由表[UPSTREAM_ROUTES 配置]
+        R1["/v1/responses<br/>→ opencode.ai/zen"]
+        R2["/ollama/v1/responses<br/>→ http://localhost:11434"]
+        R3["/ollama/v1<br/>→ http://localhost:11434"]
+    end
+
+    subgraph 回退[默认上游]
+        DEFAULT["UPSTREAM_BASE_URL<br/>→ opencode.ai/zen"]
+    end
+
+    ROUTE --> R1
+    ROUTE --> R2
+    ROUTE --> R3
+    ROUTE -->|未匹配| DEFAULT
+
+    R1 --> UP_URL1["/v1/chat/completions"]
+    R2 --> UP_URL2["/v1/chat/completions"]
+    R3 --> UP_URL3["/v1/chat/completions"]
+    DEFAULT --> UP_URL4["/v1/chat/completions"]
+```
+
+---
+
+## 六、StreamState 输出索引分配图
+
+```mermaid
+sequenceDiagram
+    participant Stream as StreamState
+    participant Handler as ResponsesHandler
+    participant Client as 客户端
+
+    Note over Stream: nextOutputIndex=0
+
+    Handler->>Stream: tool_call index=0 首次到来
+    Stream->>Stream: NextOutputIndex() → 0
+    Stream-->>Handler: output_index=0
+    Handler->>Client: response.output_item.added (web_search_call)
+
+    Handler->>Stream: tool_call index=1 首次到来
+    Stream->>Stream: NextOutputIndex() → 1
+    Stream-->>Handler: output_index=1
+    Handler->>Client: response.output_item.added (get_weather)
+
+    Handler->>Stream: 首个 content delta 到来
+    Stream->>Stream: NextOutputIndex() → 2
+    Stream-->>Handler: output_index=2
+    Handler->>Client: response.output_item.added (message)
+    Handler->>Client: response.output_text.delta (同一 output_index=2)
+
+    Handler->>Stream: finish_reason → 搜索触发
+    Stream->>Stream: NextOutputIndex() → 3
+    Stream-->>Handler: output_index=3
+    Handler->>Client: response.output_item.added (搜索结果 message)
+    Handler->>Client: response.output_text.delta (同一 output_index=3)
+```
+
+---
+
+## 七、协议转换映射图
+
+### 7.1 请求映射（Responses → Chat Completions）
 
 ```mermaid
 flowchart LR
-    subgraph 上游 SSE
-        D1[delta.content]
-        D2[delta.tool_calls]
-        D3[finish_reason]
-        D4[usage]
+    subgraph 左[Responses API]
+        IN["input<br/>(string/array)"]
+        INS["instructions"]
+        MAX["max_output_tokens"]
+        TOOLS["tools<br/>web_search/function"]
+        TEXT["text.format"]
+        STREAM["stream"]
+        OTHER["temperature/top_p/..."]
     end
 
-    subgraph 下游 SSE
-        E1[response.created]
-        E2[response.output_item.added]
-        E3[response.output_text.delta]
-        E4[response.function_call_arguments.delta]
-        E5[response.output_text.done]
-        E6[response.function_call_arguments.done]
-        E7[response.output_item.done]
-        E8[response.completed]
+    subgraph 右[Chat Completions]
+        MSGS["messages<br/>[{role,content}...]"]
+        MAXTOK["max_tokens"]
+        FUNCS["tools<br/>{type:function,...}"]
+        FMT["response_format"]
+        ST["stream"]
+        OTHERS["全部透传"]
     end
 
-    D1 --> E3 --> E5
-    D2 --> E2 --> E4 --> E7
-    D3 --> E8
-    D4 -->|token 计数| E8
+    IN -->|"convertInput()"| MSGS
+    INS -->|"头部插入 system"| MSGS
+    MAX --> MAXTOK
+    TOOLS -->|"convertTools()"| FUNCS
+    TEXT --> FMT
+    STREAM --> ST
+    OTHER --> OTHERS
 ```
 
-## 五、关键设计决策
+### 7.2 响应映射（Chat Completions → Responses）
 
-| 决策 | 说明 |
-|---|---|
-| **Tools 转换** | 所有 tool types（`web_search`、`function`、`computer` 等）统一转为 Chat Completions 的 `function` 类型。内置工具（`web_search`）使用预定义 schema |
-| **web_search 的两种处理模式** | `BLOCK_WEB_SEARCH=true` 时过滤掉 web_search 工具，由客户端自行处理搜索；`false` 时由代理执行搜索并将结果注入二次请求给模型总结 |
-| **路由分发** | 支持通过 `UPSTREAM_ROUTES` 按路径前缀匹配不同上游，最长前缀匹配，未匹配时回退到 `UPSTREAM_BASE_URL` |
-| **搜索后端切换** | 通过 `SEARCH_BACKEND` 在 Bing（解析 SERP HTML）和 SearXNG（JSON API）之间切换 |
-| **输出索引管理** | `StreamState.NextOutputIndex()` 确保每个 output item 有唯一递增的 `output_index`，消息和工具调用共享同一序列 |
-| **SearXNG 搜索响应拦截** | 当检测到上游响应仅包含 web_search tool_call 时（非流式），拦截并替换为含 web_search_call + message 的完整响应 |
+```mermaid
+flowchart LR
+    subgraph 上游[Chat 响应]
+        CHAT_ID["id"]
+        CHAT_CONTENT["choices[0].message.content"]
+        CHAT_TOOL["choices[0].message.tool_calls"]
+        CHAT_FINISH["choices[0].finish_reason"]
+        CHAT_USAGE["usage"]
+    end
+
+    subgraph 下游[Responses 响应]
+        RESP_ID["id<br/>resp_UUID 新生成"]
+        OUTPUT["output[]"]
+        RSTATUS["status"]
+        RUSAGE["usage"]
+    end
+
+    CHAT_ID -->|"丢弃"| RESP_ID
+    CHAT_CONTENT -->|"output_text"| OUTPUT
+    CHAT_TOOL -->|"web_search → web_search_call<br/>其他 → function_call"| OUTPUT
+    CHAT_FINISH -->|"MapFinishReason()"| RSTATUS
+    CHAT_USAGE -->|"convertUsage()"| RUSAGE
+```
